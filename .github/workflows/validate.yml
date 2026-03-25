@@ -1,0 +1,25 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - run: npm run validate:phase-b
+      - run: npm run validate:phase-c
+      - run: npm run validate:phase-d
+      - run: npm run validate:phase-e
+      - run: npm run validate:phase-f
+      - run: npm run validate:phase-f2
+      - run: npm run report:syscalls
+      - run: npm run tracker:update
+      - run: npm run validate:stability
+      - run: npm run validate:release
