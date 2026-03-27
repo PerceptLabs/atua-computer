@@ -149,6 +149,12 @@ self.onmessage = async (e) => {
         pipe_close(pipeId, end) {
           childPipeClose(pipeId, end);
         },
+        /* Socket stubs for child workers */
+        socket_open() { return -1; },
+        socket_connect() { return -1; },
+        socket_send() { return -1; },
+        socket_recv() { return -1; },
+        socket_close() {},
         args_sizes_get(ac, bs) {
           const view = new DataView(memory.buffer);
           view.setUint32(ac, 0, true);

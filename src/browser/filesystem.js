@@ -88,7 +88,25 @@ export class VirtualFS {
     // Normalize
     if (!path.startsWith('/')) path = '/' + path;
 
-    const content = this.files.get(path);
+    let content = this.files.get(path);
+
+    // O_CREAT (0x40 in Linux) or O_WRONLY (0x01) / O_RDWR (0x02) — create if missing
+    if (!content && (flags & 0x40)) {
+      content = new Uint8Array(0);
+      this.files.set(path, content);
+      // Register parent directories
+      const parts = path.split('/');
+      for (let i = 1; i < parts.length; i++) {
+        this.dirs.add(parts.slice(0, i).join('/') || '/');
+      }
+    }
+
+    // O_TRUNC (0x200 in Linux) — truncate existing file
+    if (content && (flags & 0x200)) {
+      content = new Uint8Array(0);
+      this.files.set(path, content);
+    }
+
     if (!content) return -1;
 
     const fd = this.nextFd++;
@@ -110,8 +128,23 @@ export class VirtualFS {
     return toRead;
   }
 
-  /** Write to an open fd (not implemented for read-only rootfs) */
+  /** Write to an open fd */
   write(fd, src, offset) {
+    const file = this.openFiles.get(fd);
+    if (!file) return -1;
+
+    const off = typeof offset === 'bigint' ? Number(offset) : (offset || 0);
+    const needed = off + src.length;
+
+    // Grow the file if needed
+    if (needed > file.content.length) {
+      const grown = new Uint8Array(needed);
+      grown.set(file.content);
+      file.content = grown;
+      this.files.set(file.path, grown);
+    }
+
+    file.content.set(src, off);
     return src.length;
   }
 

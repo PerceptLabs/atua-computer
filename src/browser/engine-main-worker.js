@@ -25,6 +25,35 @@ const pipes = new Map();
 let nextPipeId = 0;
 const PIPE_BUF_SIZE = 64 * 1024;
 
+// Socket table: sockId → { sab, control, data, isDns }
+const sockets = new Map();
+let nextSockId = 0;
+const SOCK_BUF_SIZE = 128 * 1024;
+// SAB layout: Int32Array control[8] at offset 0, Uint8Array data[SOCK_BUF_SIZE] at offset 32
+// control: [0]=writePos [1]=readPos [2]=closed [3]=connectDone [4]=errorCode [5..7]=reserved
+
+function socketRecv(sockId, buf, len) {
+  const sock = sockets.get(sockId);
+  if (!sock) return -1;
+  const { control, data } = sock;
+  const cap = data.length;
+  let bytesRead = 0;
+  while (bytesRead < len) {
+    const wp = Atomics.load(control, 0);
+    const rp = Atomics.load(control, 1);
+    if (rp === wp) {
+      if (Atomics.load(control, 2) === 1) break; // closed = EOF
+      if (bytesRead > 0) break; // partial read OK
+      Atomics.wait(control, 1, rp, 5000); // block until data or timeout
+      continue;
+    }
+    buf[bytesRead] = data[rp % cap];
+    Atomics.store(control, 1, rp + 1);
+    bytesRead++;
+  }
+  return bytesRead;
+}
+
 function createPipe() {
   const id = nextPipeId++;
   const sab = new SharedArrayBuffer(PIPE_BUF_SIZE + 16);
@@ -207,7 +236,9 @@ function createImports(args, env, getCwd, setCwd) {
     },
 
     fs_write(handle, bufPtr, len, offset) {
-      return len;
+      const o = typeof offset === 'bigint' ? Number(offset) : (offset || 0);
+      const src = new Uint8Array(memory.buffer, bufPtr, len);
+      return vfs.write(handle, src, o);
     },
 
     fs_close(handle) {
@@ -312,6 +343,67 @@ function createImports(args, env, getCwd, setCwd) {
 
     pipe_close(pipeId, end) {
       pipeClose(pipeId, end);
+    },
+
+    /* Socket imports — Phase F networking */
+    socket_open(domain, type, protocol) {
+      const sockId = nextSockId++;
+      const sab = new SharedArrayBuffer(SOCK_BUF_SIZE + 32);
+      const control = new Int32Array(sab, 0, 8);
+      const data = new Uint8Array(sab, 32, SOCK_BUF_SIZE);
+      const isDns = (type === 2); // SOCK_DGRAM = 2 = likely DNS
+      sockets.set(sockId, { sab, control, data, isDns, peerPort: 0 });
+      self.postMessage({ type: 'socket-open', sockId, sab });
+      return 300 + sockId;
+    },
+
+    socket_connect(sockId, addrPtr, addrLen) {
+      // addrPtr points to sockaddr_in in WASM memory:
+      //   [0-1] = sin_family (AF_INET=2)
+      //   [2-3] = sin_port (network byte order = big-endian)
+      //   [4-7] = sin_addr (4 bytes)
+      const id = sockId - 300;
+      const sock = sockets.get(id);
+      if (!sock) return -1;
+      const addrBuf = new Uint8Array(memory.buffer, addrPtr, addrLen);
+      const port = (addrBuf[2] << 8) | addrBuf[3]; // big-endian
+      const ip = `${addrBuf[4]}.${addrBuf[5]}.${addrBuf[6]}.${addrBuf[7]}`;
+      sock.peerPort = port;
+      if (port === 53) sock.isDns = true;
+      self.postMessage({ type: 'socket-connect', sockId: id, ip, port });
+      // Block until main thread signals connect result
+      while (Atomics.load(sock.control, 3) === 0) {
+        Atomics.wait(sock.control, 3, 0, 30000);
+      }
+      const result = Atomics.load(sock.control, 3);
+      return result === 1 ? 0 : -1;
+    },
+
+    socket_send(sockId, bufPtr, len) {
+      const id = sockId - 300;
+      const sock = sockets.get(id);
+      if (!sock) return -1;
+      const data = new Uint8Array(memory.buffer, bufPtr, len).slice();
+      if (sock.isDns && sock.peerPort === 53) {
+        self.postMessage({ type: 'dns-query', sockId: id, data: data.buffer }, [data.buffer]);
+      } else {
+        self.postMessage({ type: 'socket-send', sockId: id, data: data.buffer }, [data.buffer]);
+      }
+      return len;
+    },
+
+    socket_recv(sockId, bufPtr, len) {
+      const id = sockId - 300;
+      const sock = sockets.get(id);
+      if (!sock) return -1;
+      const buf = new Uint8Array(memory.buffer, bufPtr, len);
+      return socketRecv(id, buf, len);
+    },
+
+    socket_close(sockId) {
+      const id = sockId - 300;
+      self.postMessage({ type: 'socket-close', sockId: id });
+      sockets.delete(id);
     },
 
     fork_spawn(statePtr, stateLen) {
