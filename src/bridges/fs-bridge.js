@@ -2,7 +2,7 @@
  * FsBridge — Filesystem bridge to AtuaFS (OPFS-backed).
  *
  * This bridge routes guest filesystem operations from the engine's
- * WASIX fd calls to the real AtuaFS persistent filesystem.
+ * WASI fd calls to the real AtuaFS persistent filesystem.
  *
  * Phase B: Minimal — engine reads ELF binaries from a provided buffer.
  * Phase C: Full — block-streaming ext2 rootfs + AtuaFS project mount.

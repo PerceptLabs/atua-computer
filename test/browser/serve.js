@@ -25,13 +25,13 @@ const MIME = {
 };
 
 const FILE_MAP = {
-  '/': path.join(__dirname, 'index.html'),
-  '/engine-wasix.wasm': path.join(ROOT, 'wasm/engine-wasix.wasm'),
+  '/': path.join(ROOT, 'src/browser/index.html'),
+  '/engine.wasm': path.join(ROOT, 'src/browser/engine.wasm'),
   '/hello.elf': path.join(ROOT, 'test/fixtures/hello.elf'),
 };
 
 const server = http.createServer((req, res) => {
-  // Required for SharedArrayBuffer (needed by @wasmer/sdk)
+  // Required for SharedArrayBuffer
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
 
@@ -54,6 +54,6 @@ server.listen(PORT, () => {
   console.log(`atua-computer browser test server`);
   console.log(`http://localhost:${PORT}`);
   console.log(`COOP/COEP headers enabled for SharedArrayBuffer`);
-  console.log(`Serving engine.wasm from: ${FILE_MAP['/engine-wasix.wasm']}`);
+  console.log(`Serving engine.wasm from: ${FILE_MAP['/engine.wasm']}`);
   console.log(`Serving hello.elf from: ${FILE_MAP['/hello.elf']}`);
 });

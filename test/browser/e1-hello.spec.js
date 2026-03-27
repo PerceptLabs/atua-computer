@@ -110,7 +110,7 @@ test('engine.wasm imports only from atua namespace', () => {
 
   expect(modules.has('atua')).toBe(true);
   expect(modules.has('wasi_snapshot_preview1')).toBe(false);
-  expect(modules.has('wasix_32v1')).toBe(false);
+  expect(modules.has('wasi_32v1')).toBe(false);
 });
 
 test('hello.elf produces output in browser', async ({ page }) => {

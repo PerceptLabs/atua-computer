@@ -2,7 +2,7 @@
  * NetBridge — Network bridge to atua-net (Wisp relay).
  *
  * This bridge routes guest socket operations from the engine's
- * WASIX socket calls to the real atua-net outbound networking stack.
+ * WASI socket calls to the real atua-net outbound networking stack.
  *
  * Phase D: Full — socket, connect, send, recv, DNS resolution.
  * Not needed for Phase B or C.
@@ -15,7 +15,7 @@ export class NetBridge {
   async open({ host, port, protocol = 'tcp' }) {
     throw new Error(
       `NOT IMPLEMENTED: NetBridge.open(${host}:${port}) — atua-net integration not yet built. ` +
-      'Requires: WASIX socket calls routed to atua-net Wisp relay.'
+      'Requires: WASI socket calls routed to atua-net Wisp relay.'
     );
   }
 

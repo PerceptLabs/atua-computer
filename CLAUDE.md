@@ -48,7 +48,7 @@ Temporary simplifications that are never replaced are lies.
 
 ### Use real tools for real work.
 
-- Compile Blink with wasi-sdk + wasix-libc. Do not try to "simulate" what Blink does in JavaScript.
+- Compile Blink with wasi-sdk + wasi-sdk. Do not try to "simulate" what Blink does in JavaScript.
 - Build the Alpine rootfs with real Alpine tools (apk, mkinitfs, or Dockerfile-based pipeline). Do not create a fake rootfs from JavaScript objects.
 - Cross-compile test binaries with a real musl cross-compiler. Do not write JavaScript that pretends to be a compiled binary.
 - Use @wasmer/sdk to load and run the engine WASM binary. Do not write a JavaScript "WASM emulator."
@@ -85,7 +85,7 @@ assert.strictEqual(result.stdout, 'hello from atua-computer\n');
 If a phase gate fails, report it as failed. Do not adjust the gate criteria to match what currently works. Do not redefine "engine bring-up" to mean "mock returns correct strings."
 
 The progress tracker must reflect reality:
-- "Phase B: In Progress — engine compiles to WASIX, static ELF loads, write() syscall not yet bridged to terminal"
+- "Phase B: In Progress — engine compiles to WASI, static ELF loads, write() syscall not yet bridged to terminal"
 - NOT: "Phase B: Complete" when the engine is a command string matcher.
 
 ### Do not conflate class naming with real implementation.
@@ -108,17 +108,17 @@ Only write new code for glue between existing components, not reimplementations 
 
 ## Architecture Constraints
 
-### WASIX is the compilation target for the engine.
+### WASI is the compilation target for the engine.
 
-The engine (Blink) compiles to WASIX via wasi-sdk + wasix-libc sysroot. It runs on @wasmer/sdk. It does NOT compile via Emscripten. It does NOT run as browser-native JavaScript. It does NOT run as a standalone WASM module outside @wasmer/sdk.
+The engine (Blink) compiles to WASI via wasi-sdk + wasi-sdk sysroot. It runs on @wasmer/sdk. It does NOT compile via Emscripten. It does NOT run as browser-native JavaScript. It does NOT run as a standalone WASM module outside @wasmer/sdk.
 
 ### AtuaFS is the filesystem.
 
-Guest file operations route through WASIX fd calls to AtuaFS (OPFS-backed). Not IndexedDB. Not in-memory Maps. Not localStorage. AtuaFS.
+Guest file operations route through WASI fd calls to AtuaFS (OPFS-backed). Not IndexedDB. Not in-memory Maps. Not localStorage. AtuaFS.
 
 ### atua-net is the network.
 
-Guest socket operations route through WASIX socket calls to atua-net (Wisp relay). Not fetch(). Not XMLHttpRequest. Not fake connections. atua-net.
+Guest socket operations route through WASI socket calls to atua-net (Wisp relay). Not fetch(). Not XMLHttpRequest. Not fake connections. atua-net.
 
 ### The rootfs is ext2 with block-level streaming.
 
@@ -156,11 +156,11 @@ atua-computer/
   atua-computer-cc-brief.md           # This implementation brief
   CLAUDE.md                           # This file — project rules
   src/
-    engine/                           # Real engine integration (Blink-on-WASIX)
+    engine/                           # Real engine integration (Blink-on-WASI)
     bridges/                          # Real bridges (AtuaFS, atua-net, xterm.js)
     mcp/                              # MCP tool registry (keep existing)
     runtime.js                        # Runtime wrapper (keep existing shape)
-  native/                             # Blink source fork, WASIX build scripts
+  native/                             # Blink source fork, WASI build scripts
   rootfs/                             # Alpine rootfs build pipeline (Dockerfile, scripts)
   wasm/                               # Built WASM artifacts (engine.wasm, etc.)
   test/                               # Real tests against real behavior

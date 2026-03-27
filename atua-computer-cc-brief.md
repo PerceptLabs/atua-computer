@@ -46,13 +46,13 @@ The `atua-computer` repo contains a mock. Read this section completely before to
 
 ## 2. What You Are Actually Building
 
-A browser-native Linux userspace runtime. Real x86-64 binaries from real Alpine packages execute inside a Blink-derived engine compiled to WASIX, running on @wasmer/sdk. The engine interprets x86-64 instructions and handles Linux syscalls by routing them to Atua's existing infrastructure (AtuaFS for files, atua-net for networking, xterm.js for terminal).
+A browser-native Linux userspace runtime. Real x86-64 binaries from real Alpine packages execute inside a Blink-derived engine compiled to WASM (via wasi-sdk), running in the browser. The engine interprets x86-64 instructions and handles Linux syscalls by routing them to Atua's existing infrastructure (AtuaFS for files, atua-net for networking, xterm.js for terminal).
 
 ### The engine
 
 Blink (github.com/jart/blink, ISC license) is a 63,500-line ANSI C11 x86-64 Linux userspace emulator. It interprets 500+ x86-64 instructions and handles 150+ Linux syscalls. It has an ELF loader (static and dynamic), a VFS layer, lazy flags computation, and passes 652 test suites.
 
-Your job: compile Blink to WASIX using wasi-sdk + wasix-libc sysroot. Replace its native I/O with WASIX bridges to AtuaFS, atua-net, and xterm.js. The result is `engine.wasm` — a WASIX binary that @wasmer/sdk loads and runs.
+Your job: compile Blink to WASM using wasi-sdk. Replace its native I/O with atua bridges to AtuaFS, atua-net, and xterm.js. The result is `engine.wasm` — a WASM binary that the browser loads and runs natively.
 
 ### The bridges
 
@@ -83,28 +83,28 @@ Nitro (github.com/leahneukirchen/nitro, MIT) runs as PID 1 inside the engine. It
 
 ## 3. Phase B — The First Real Task
 
-**Goal:** Blink compiled to WASIX. Loads a static x86-64 ELF. Executes it. Output appears in the terminal.
+**Goal:** Blink compiled to WASM. Loads a static x86-64 ELF. Executes it. Output appears in the terminal.
 
-### Step 1: Fork Blink and set up WASIX build
+### Step 1: Fork Blink and set up WASM build
 
 ```
 git clone https://github.com/jart/blink
 ```
 
-Strip what doesn't apply in WASIX:
+Strip what doesn't apply in WASM:
 - Blink's native JIT (generates x86-64 machine code — not applicable in WASM)
-- Native fork() calls (WASIX has no fork — needs serialization-based emulation later)
+- Native fork() calls (WASM has no fork — needs serialization-based emulation later)
 - Native mmap(PROT_EXEC) (WASM can't execute generated code in linear memory)
 
 Keep everything else: interpreter, ELF loader, syscall dispatch, VFS, lazy flags, instruction decoder.
 
 Compile with:
 ```
-wasi-sdk + wasix-libc sysroot
+wasi-sdk
 -pthread -matomics -mbulk-memory
 ```
 
-Target output: `engine.wasm` that @wasmer/sdk can load.
+Target output: `engine.wasm` that the browser can load natively.
 
 ### Step 2: Minimal syscall set
 
@@ -132,7 +132,7 @@ x86_64-linux-musl-gcc -static -o hello hello.c
 ### Step 4: Wire it into the runtime
 
 Replace the fake engine with real engine integration in `runtime.js`:
-- `boot()` → load engine.wasm via @wasmer/sdk, initialize bridges
+- `boot()` → load engine.wasm via browser-native WebAssembly API, initialize bridges
 - `exec("./hello")` → engine loads hello ELF, interprets x86-64 instructions, write() syscall routes to terminal, "hello from atua-computer" appears
 
 ### Step 5: Validate
@@ -229,7 +229,7 @@ Each phase builds on real, tested behavior from the previous phase. Do NOT skip 
 
 ## 6. What "Done" Looks Like for Each Phase
 
-Phase B is done when: a real x86-64 static ELF binary executes real instructions on a real Blink-on-WASIX engine and produces real output through a real terminal bridge. Not when a mock returns a canned string.
+Phase B is done when: a real x86-64 static ELF binary executes real instructions on a real Blink-on-WASM engine and produces real output through a real terminal bridge. Not when a mock returns a canned string.
 
 Phase C is done when: real bash runs on a real Alpine rootfs with real files accessible through a real AtuaFS bridge. Not when an in-memory Map returns hardcoded directory listings.
 

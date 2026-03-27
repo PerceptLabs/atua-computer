@@ -4,9 +4,9 @@
 
 - Ubuntu 24.04 (Docker container `atua-computer`)
 - wasi-sdk 32 (installed at `/opt/wasi-sdk-32.0-x86_64-linux`)
-- wasix-libc sysroot (installed at `/opt/wasix-sysroot/sysroot`)
+- wasi-sdk sysroot (installed at `/opt/wasi-sysroot/sysroot`)
 - Blink source (patched, at `/home/ubuntu/blink`)
-- blink-wasix-compat.h (at `/home/ubuntu/blink-wasix-compat.h`)
+- blink-wasi-compat.h (at `/home/ubuntu/blink-wasi-compat.h`)
 - Stub headers (at `/home/ubuntu/stubs/sys/mount.h`)
 
 ## Build
@@ -18,10 +18,10 @@ docker exec atua-computer /bin/bash /workspace/native/build-wasi.sh
 
 ## Key Build Details
 
-- **Target:** wasm32-wasip1 (WASIX via wasix-libc sysroot)
+- **Target:** wasm32-wasip1 (WASI via wasi-sdk sysroot)
 - **Entry:** `_start` from crt1.o (not `--entry=__main_argc_argv`)
 - **Libraries:** `-lc -lm -lwasi-emulated-mman -lwasi-emulated-process-clocks -lpthread -lclang_rt.builtins-wasm32`
-- **Stubs:** `wasix_stubs.o` provides `mprotect`, `flock`, `__wasm_init_tls`, `syscall`, `sockatmark`, `GetRandom`, `sched_*`, `SysIoctl`, `SendAncillary`, `ReceiveAncillary`, `sysinfo`
+- **Stubs:** `wasi_stubs.o` provides `mprotect`, `flock`, `__wasm_init_tls`, `syscall`, `sockatmark`, `GetRandom`, `sched_*`, `SysIoctl`, `SendAncillary`, `ReceiveAncillary`, `sysinfo`
 - **Compat header:** Force-included, provides S_IFIFO/S_IFSOCK overrides, HAVE_FORK, spawn.h, sigsetjmp→setjmp mapping
 - **Assertions:** Disabled with `-DNDEBUG` (assertions trigger on WASI due to setjmp limitations)
 - **ancillary.c:** Fails to compile (nonnull error) — not needed, stubs provided
@@ -33,7 +33,7 @@ wasmer run \
   --volume /path/to/rootfs:/rootfs \
   --env BLINK_PREFIX=/rootfs \
   --env BLINK_WASM_SELF=/rootfs/engine.wasm \
-  engine-wasix.wasm -- /rootfs/bin/bash -c "echo hello"
+  engine-wasi.wasm -- /rootfs/bin/bash -c "echo hello"
 ```
 
 - `BLINK_PREFIX`: Prepended to guest absolute paths for host file access

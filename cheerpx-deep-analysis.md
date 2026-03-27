@@ -191,9 +191,9 @@ ENGINE WORKER                              MAIN THREAD
 
 ### Atua adaptation:
 
-For atua-computer on WASIX/@wasmer/sdk:
-- Engine (Blink compiled to WASIX) writes WASM bytes to shared linear memory
-- Calls a WASIX import: `__host_compile_block(offset, length) → handle`
+For atua-computer on browser-native WASM:
+- Engine (Blink compiled to WASM) writes WASM bytes to shared linear memory
+- Calls an atua import: `__host_compile_block(offset, length) → handle`
 - Host JS receives the call, extracts bytes from shared memory
 - Host compiles via `@wasmer/sdk` module compilation or `WebAssembly.compile()`
 - Returns handle that engine stores in its dispatch table
@@ -581,13 +581,13 @@ worker.postMessage({ type: 12, ioTransaction: txId });
 
 ### Atua adaptation:
 
-For WASIX on @wasmer/sdk:
-- WASIX threads already support `Atomics.wait()` / `Atomics.notify()` on SharedArrayBuffer
-- The engine's linear memory IS a SharedArrayBuffer (WASIX requirement for threading)
-- When engine needs I/O: call a WASIX import function that triggers the host
+For browser-native WASM:
+- WASM threads support `Atomics.wait()` / `Atomics.notify()` on SharedArrayBuffer
+- The engine's linear memory IS a SharedArrayBuffer (requirement for threading)
+- When engine needs I/O: call an atua import function that triggers the host
 - Host completes I/O, writes result to shared memory, calls `Atomics.notify()`
 - Engine wakes up and reads the result
-- This is simpler than CheerpX's approach because WASIX provides the blocking primitive natively
+- This is simpler than CheerpX's approach because WASM provides the blocking primitive natively
 
 ---
 
@@ -639,13 +639,13 @@ CheerpX can spawn additional workers for CPU-parallel operations. Each new worke
 
 The boot sequence for atua-computer should be:
 1. Load engine.wasm in Worker via @wasmer/sdk
-2. Initialize WASIX instance with shared memory
-3. Attach bridges (FS, net, terminal) via WASIX imports
+2. Initialize WASM instance with shared memory
+3. Attach bridges (FS, net, terminal) via atua imports
 4. Engine starts, loads Nitro as PID 1 from ext2 rootfs
 5. Nitro boots, starts agent-shell service
 6. Bash prompt appears in xterm.js
 
-No separate clock worker needed — `performance.now()` is available in WASIX Workers via the WASIX clock import. No separate MessageChannel needed — @wasmer/sdk handles thread communication internally.
+No separate clock worker needed — `performance.now()` is available in Workers via the atua clock import. No separate MessageChannel needed — the engine worker handles thread communication internally.
 
 ---
 
@@ -787,7 +787,7 @@ The pattern `if (a[f].a0 !== null)` checks whether a continuation has a pending 
 ### Atua adaptation:
 
 This pattern is specific to Cheerp's compilation of C++ async code to JavaScript. Atua doesn't need this because:
-- Blink compiled to WASIX uses native WASIX blocking (Atomics.wait) — no callback-based async
+- Blink compiled to WASM uses native blocking (Atomics.wait) — no callback-based async
 - Host-side JS uses standard async/await
 - The message-passing protocol handles the async boundary
 
@@ -887,7 +887,7 @@ Two paths for loading the engine Worker:
 Based on this comprehensive analysis, here are the core architectural components atua-computer needs, mapped from CheerpX's proven patterns:
 
 ### Must build:
-1. **Engine Worker** — Blink compiled to WASIX, running in @wasmer/sdk Worker
+1. **Engine Worker** — Blink compiled to WASM, running in a dedicated Worker
 2. **Typed message protocol** — structured {type, ...fields} messages between engine and host
 3. **SharedArrayBuffer memory** — engine's linear memory shared with host for zero-copy I/O and JIT
 4. **Block device streaming** — HTTP Range fetch + OPFS cache + OPFS write overlay

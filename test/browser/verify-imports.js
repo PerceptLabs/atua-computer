@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Verify engine.wasm imports ONLY from "atua" namespace.
- * Fails if any wasi_snapshot_preview1 or wasix_32v1 imports exist.
+ * Fails if any wasi_snapshot_preview1 or wasi_32v1 imports exist.
  *
  * Usage: node test/browser/verify-imports.js [path/to/engine.wasm]
  */
@@ -78,7 +78,7 @@ for (const [mod, imports] of Object.entries(modules).sort()) {
 }
 
 // Check for forbidden imports
-const forbidden = ['wasi_snapshot_preview1', 'wasix_32v1'];
+const forbidden = ['wasi_snapshot_preview1', 'wasi_32v1'];
 for (const mod of forbidden) {
   if (modules[mod]) {
     console.error(`\nFAIL: Found ${modules[mod].length} imports from "${mod}"`);
@@ -97,5 +97,5 @@ if (failed) {
   process.exit(1);
 } else {
   const atuaCount = modules['atua']?.length || 0;
-  console.log(`\n✅ PASS: ${atuaCount} atua imports, zero WASI/WASIX`);
+  console.log(`\n✅ PASS: ${atuaCount} atua imports, zero WASI/WASI`);
 }

@@ -2,7 +2,7 @@
  * ProductionAtuaLinuxEngine — Production engine configuration.
  *
  * This exists only when it adds real behavior on top of AtuaLinuxEngine.
- * Currently, AtuaLinuxEngine IS the production engine (Blink on WASIX).
+ * Currently, AtuaLinuxEngine IS the production engine (Blink on WASI).
  * There is no separate "production" wrapper — the engine either works or
  * it throws NOT IMPLEMENTED.
  *

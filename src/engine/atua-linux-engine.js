@@ -7,7 +7,7 @@
  * in turn loads and executes guest x86-64 ELF binaries.
  *
  * Phase B: Emscripten + NODERAWFS (Node.js child process).
- * Future: WASIX + @wasmer/sdk (browser-native, in-process).
+ * Future: WASI + @wasmer/sdk (browser-native, in-process).
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';

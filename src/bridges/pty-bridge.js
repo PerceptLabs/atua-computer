@@ -2,7 +2,7 @@
  * PtyBridge — Terminal bridge to xterm.js.
  *
  * This bridge routes guest terminal I/O from the engine's
- * WASIX fd operations and ioctl calls to xterm.js via xterm-pty patterns.
+ * WASI fd operations and ioctl calls to xterm.js via xterm-pty patterns.
  *
  * Phase B: Minimal — capture stdout/stderr from engine fd 1/2 writes.
  * Phase C: Full — PTY/TTY with termios, raw mode, line editing for bash.

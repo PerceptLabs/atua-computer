@@ -7,7 +7,7 @@
  *
  * The tracer code itself is sound. The problem was that the old fake
  * engine called trace() with fabricated syscall names that never actually
- * executed. With the real engine, trace() will be called from the WASIX
+ * executed. With the real engine, trace() will be called from the WASI
  * bridge layer when the engine actually dispatches a Linux syscall.
  */
 

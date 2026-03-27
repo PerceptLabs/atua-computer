@@ -14,7 +14,7 @@
 
 ## Architecture
 
-Fork+exec implemented via WASIX `posix_spawn` (backed by `proc_spawn2`):
+Fork+exec implemented via WASI `posix_spawn` (backed by `proc_spawn2`):
 
 1. Guest calls `clone(SIGCHLD)` → Blink's `SysClone` returns 0 (vfork child path)
 2. Guest calls `execve("/bin/ls", ...)` → Blink's `SysExecve` calls `posix_spawn` to create a new WASM engine process with the target binary as argument
@@ -36,8 +36,8 @@ Each shell command spawns a new engine WASM process via wasmer's `proc_spawn2` s
 ```bash
 # All executed through wasmer CLI:
 wasmer run --volume /tmp/alpine-rootfs:/rootfs --volume /workspace/wasm:/engine \
-  --env BLINK_WASM_SELF=/engine/engine-wasix.wasm \
-  /workspace/wasm/engine-wasix.wasm \
+  --env BLINK_WASM_SELF=/engine/engine.wasm \
+  /workspace/wasm/engine.wasm \
   -- /rootfs/bin/busybox.static sh -c "<command>"
 ```
 

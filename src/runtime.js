@@ -44,7 +44,7 @@ export class AtuaComputerRuntime {
     if (this._booted) return;
     this._emit('runtime.boot.started', { options });
 
-    // Boot the real engine (loads Blink WASIX binary, initializes bridges)
+    // Boot the real engine (loads Blink WASI binary, initializes bridges)
     await this._engine.boot(options);
 
     this._booted = true;
