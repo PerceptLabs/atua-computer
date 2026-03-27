@@ -39,6 +39,9 @@
         rootfsUrl: '/debian-mini.tar',
         args: ['engine', binary, ...extraArgs],
         env: { HOME: '/' },
+        files: {
+          '/etc/resolv.conf': new TextEncoder().encode('nameserver 1.1.1.1\n'),
+        },
         wispRelayUrl: relayUrl || undefined,
         dnsProxyUrl: dnsProxy || undefined,
         onOutput: (bytes) => {

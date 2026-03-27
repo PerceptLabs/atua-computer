@@ -15,6 +15,7 @@ export class AtuaComputer {
     this._wisp = null;
     this._socketSabs = new Map(); // sockId → { sab, control, data, streamId }
     this._dnsProxyUrl = null;
+    this._dnsCache = new Map(); // ip → hostname (reverse map from DNS resolution)
     // Create stdin SharedArrayBuffer eagerly so writeStdin can be called before boot completes
     this._stdinSab = new SharedArrayBuffer(4096 + 16);
     this._stdinControl = new Int32Array(this._stdinSab, 0, 4);
@@ -172,7 +173,10 @@ export class AtuaComputer {
       return;
     }
 
-    const streamId = this._wisp.createStream(ip, port, {
+    // Use hostname from DNS cache if available (relay resolves hostname,
+    // avoiding raw-IP routing issues with proxies/VPNs)
+    const host = this._dnsCache.get(ip) || ip;
+    const streamId = this._wisp.createStream(host, port, {
       onConnect: () => {
         Atomics.store(entry.control, 3, 1); // connected
         Atomics.notify(entry.control, 3);
@@ -246,6 +250,8 @@ export class AtuaComputer {
         const response = this._buildDnsResponse(queryBuf, null);
         this._writeToSocketSab(entry, response);
       } else {
+        // Cache ip→hostname so connect() can pass hostname to relay
+        this._dnsCache.set(ip, hostname);
         const response = this._buildDnsResponse(queryBuf, ip);
         this._writeToSocketSab(entry, response);
       }

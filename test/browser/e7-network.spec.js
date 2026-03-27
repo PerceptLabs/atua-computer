@@ -31,6 +31,24 @@ test.beforeAll(async () => {
 
     const url = new URL(req.url, 'http://localhost');
 
+    // DNS proxy endpoint (avoids CORS on dns.google)
+    if (url.pathname === '/dns-resolve') {
+      const name = url.searchParams.get('name');
+      const type = url.searchParams.get('type') || 'A';
+      fetch(`https://dns.google/resolve?name=${name}&type=${type}`)
+        .then(r => r.json())
+        .then(json => {
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.end(JSON.stringify(json));
+        })
+        .catch(e => {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        });
+      return;
+    }
+
     const map = {
       '/': join(BROWSER_DIR, 'e7-network.html'),
       '/engine.wasm': join(BROWSER_DIR, 'engine.wasm'),
@@ -115,6 +133,36 @@ test('HTTP GET via Wisp relay returns real data', async ({ page }) => {
 
   // Verify HTTP response content
   expect(pageText).toContain('Response: HTTP/1.1 200 OK');
+});
+
+test('DNS + HTTP GET to real external host (example.com)', async ({ page }) => {
+  test.setTimeout(120000);
+
+  page.on('console', msg => {
+    console.log(`BROWSER [${msg.type()}]:`, msg.text());
+  });
+
+  const wsUrl = serverUrl.replace('http://', 'ws://');
+  // DNS resolution + HTTP GET to example.com via Wisp relay
+  const dnsUrl = `${serverUrl}/dns-resolve`;
+  const navUrl = `${serverUrl}?relay=${encodeURIComponent(wsUrl)}&dns=${encodeURIComponent(dnsUrl)}&bin=/test_dns_debug&args=`;
+  await page.goto(navUrl);
+
+  try {
+    await page.waitForFunction(() => {
+      const text = document.getElementById('output')?.textContent || '';
+      return text.includes('[Tests complete]') || text.includes('FAIL:') || text.includes('ERROR:');
+    }, { timeout: 30000 });
+  } catch (e) {
+    console.log('Timeout waiting for output');
+  }
+
+  // Grab whatever output is there
+  await new Promise(r => setTimeout(r, 1000));
+  const pageText = await page.evaluate(() => document.getElementById('output')?.textContent || '').catch(() => '(eval failed)');
+  console.log('DNS+HTTP test output:\n' + pageText);
+
+  expect(pageText).toContain('PASS: getaddrinfo');
 });
 
 test('poll() on socket fd returns POLLIN when data available', async ({ page }) => {

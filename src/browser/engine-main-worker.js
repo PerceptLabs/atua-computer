@@ -371,7 +371,17 @@ function createImports(args, env, getCwd, setCwd) {
       const port = (addrBuf[2] << 8) | addrBuf[3]; // big-endian
       const ip = `${addrBuf[4]}.${addrBuf[5]}.${addrBuf[6]}.${addrBuf[7]}`;
       sock.peerPort = port;
-      if (port === 53) sock.isDns = true;
+      if (port === 53) {
+        sock.isDns = true;
+        // DNS sockets don't go through the relay — DoH handles resolution
+        // when sendto() is called. Just return success.
+        return 0;
+      }
+      if (ip === '127.0.0.1' || ip === '0.0.0.0') {
+        // Loopback connect — used by musl's AI_ADDRCONFIG check.
+        // Return success so getaddrinfo doesn't fail with EAI_SYSTEM.
+        return 0;
+      }
       self.postMessage({ type: 'socket-connect', sockId: id, ip, port });
       // Block until main thread signals connect result
       while (Atomics.load(sock.control, 3) === 0) {
@@ -386,7 +396,8 @@ function createImports(args, env, getCwd, setCwd) {
       const sock = sockets.get(id);
       if (!sock) return -1;
       const data = new Uint8Array(memory.buffer, bufPtr, len).slice();
-      if (sock.isDns && sock.peerPort === 53) {
+      if (sock.isDns) {
+        // UDP/DNS socket — route to main thread DoH resolver
         self.postMessage({ type: 'dns-query', sockId: id, data: data.buffer }, [data.buffer]);
       } else {
         self.postMessage({ type: 'socket-send', sockId: id, data: data.buffer }, [data.buffer]);
