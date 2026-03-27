@@ -113,6 +113,33 @@ test('HTTP GET via Wisp relay returns real data', async ({ page }) => {
   // Verify response was received
   expect(pageText).toContain('PASS: read(');
 
-  // Verify response data was received (content verification depends on buffering)
-  expect(pageText).toContain('Response:');
+  // Verify HTTP response content
+  expect(pageText).toContain('Response: HTTP/1.1 200 OK');
+});
+
+test('poll() on socket fd returns POLLIN when data available', async ({ page }) => {
+  test.setTimeout(120000);
+
+  page.on('console', msg => {
+    if (msg.type() === 'error') console.log('BROWSER ERROR:', msg.text());
+  });
+
+  const wsUrl = serverUrl.replace('http://', 'ws://');
+  const navUrl = `${serverUrl}?relay=${encodeURIComponent(wsUrl)}&echoPort=${echoPort}&bin=/test_poll_socket&args=127.0.0.1,${echoPort}`;
+  await page.goto(navUrl);
+
+  try {
+    await page.waitForFunction(() => {
+      const text = document.getElementById('output')?.textContent || '';
+      return text.includes('[Tests complete]') || text.includes('FAIL:') || text.includes('ERROR:');
+    }, { timeout: 30000 });
+  } catch (e) {}
+
+  const pageText = await page.evaluate(() => document.getElementById('output')?.textContent || '').catch(() => '');
+  console.log('Poll test output:\n' + pageText);
+
+  expect(pageText).toContain('PASS: socket()');
+  expect(pageText).toContain('PASS: connect()');
+  expect(pageText).toContain('PASS: poll()');
+  expect(pageText).toContain('PASS: read(');
 });

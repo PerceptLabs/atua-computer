@@ -32,7 +32,7 @@ const SOCK_BUF_SIZE = 128 * 1024;
 // SAB layout: Int32Array control[8] at offset 0, Uint8Array data[SOCK_BUF_SIZE] at offset 32
 // control: [0]=writePos [1]=readPos [2]=closed [3]=connectDone [4]=errorCode [5..7]=reserved
 
-function socketRecv(sockId, buf, len) {
+function socketRecvToArray(sockId, buf, len) {
   const sock = sockets.get(sockId);
   if (!sock) return -1;
   const { control, data } = sock;
@@ -42,9 +42,9 @@ function socketRecv(sockId, buf, len) {
     const wp = Atomics.load(control, 0);
     const rp = Atomics.load(control, 1);
     if (rp === wp) {
-      if (Atomics.load(control, 2) === 1) break; // closed = EOF
-      if (bytesRead > 0) break; // partial read OK
-      Atomics.wait(control, 1, rp, 5000); // block until data or timeout
+      if (Atomics.load(control, 2) === 1) break;
+      if (bytesRead > 0) break;
+      Atomics.wait(control, 1, rp, 5000);
       continue;
     }
     buf[bytesRead] = data[rp % cap];
@@ -53,6 +53,8 @@ function socketRecv(sockId, buf, len) {
   }
   return bytesRead;
 }
+
+/* socketRecv is unused now — socketRecvToArray handles all socket recv */
 
 function createPipe() {
   const id = nextPipeId++;
@@ -396,14 +398,29 @@ function createImports(args, env, getCwd, setCwd) {
       const id = sockId - 300;
       const sock = sockets.get(id);
       if (!sock) return -1;
+      // C passes a small WASM stack buffer (≤4096, always single page).
+      // Write directly via Uint8Array view — no page-spanning risk.
       const buf = new Uint8Array(memory.buffer, bufPtr, len);
-      return socketRecv(id, buf, len);
+      return socketRecvToArray(id, buf, len);
     },
 
     socket_close(sockId) {
       const id = sockId - 300;
       self.postMessage({ type: 'socket-close', sockId: id });
       sockets.delete(id);
+    },
+
+    socket_poll(sockId) {
+      const id = sockId - 300;
+      const sock = sockets.get(id);
+      if (!sock) return 0;
+      const { control } = sock;
+      let result = 2; // always writable
+      const wp = Atomics.load(control, 0);
+      const rp = Atomics.load(control, 1);
+      if (wp !== rp) result |= 1; // readable (data available)
+      if (Atomics.load(control, 2) === 1) result |= 5; // closed: readable (EOF) + hup
+      return result;
     },
 
     fork_spawn(statePtr, stateLen) {

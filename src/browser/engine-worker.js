@@ -155,6 +155,7 @@ self.onmessage = async (e) => {
         socket_send() { return -1; },
         socket_recv() { return -1; },
         socket_close() {},
+        socket_poll() { return 0; },
         args_sizes_get(ac, bs) {
           const view = new DataView(memory.buffer);
           view.setUint32(ac, 0, true);

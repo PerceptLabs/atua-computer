@@ -25,16 +25,19 @@
     const relayUrl = params.get('relay');
     const dnsProxy = params.get('dns');
     const echoPort = params.get('echoPort') || '80';
+    const binary = params.get('bin') || '/test_http_get';
+    const extraArgs = params.get('args') ? params.get('args').split(',') : ['127.0.0.1', echoPort, '/', 'localhost'];
 
     try {
       const computer = new AtuaComputer();
       log('Booting engine with networking...\n');
       log('Relay: ' + (relayUrl || 'none') + '\n');
+      log('Binary: ' + binary + ' ' + extraArgs.join(' ') + '\n');
 
       await computer.boot({
         engineUrl: '/engine.wasm',
         rootfsUrl: '/debian-mini.tar',
-        args: ['engine', '/test_http_get', '127.0.0.1', echoPort, '/', 'localhost'],
+        args: ['engine', binary, ...extraArgs],
         env: { HOME: '/' },
         wispRelayUrl: relayUrl || undefined,
         dnsProxyUrl: dnsProxy || undefined,
