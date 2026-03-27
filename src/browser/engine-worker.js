@@ -185,7 +185,11 @@ self.onmessage = async (e) => {
       }
     }
 
-    // Notify parent that child exited
-    self.postMessage({ type: 'exit', pid, code: 0 });
+    // Read exit code from exported function (set by __wasi_proc_exit before trap)
+    let exitCode = 0;
+    try {
+      if (instance.exports.get_exit_code) exitCode = instance.exports.get_exit_code();
+    } catch(e) {}
+    self.postMessage({ type: 'exit', pid, code: exitCode });
   }
 };

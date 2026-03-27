@@ -326,7 +326,7 @@ function createImports(args, env, getCwd, setCwd) {
       }
 
       // Create a SharedArrayBuffer flag for wait synchronization
-      const waitFlag = new SharedArrayBuffer(4);
+      const waitFlag = new SharedArrayBuffer(8); // [0]=done flag, [1]=exit code
       const waitFlagView = new Int32Array(waitFlag);
 
       // Serialize pipe SABs for the child
@@ -356,9 +356,14 @@ function createImports(args, env, getCwd, setCwd) {
       if (!waiter) return -1;
 
       // Block until child sets the flag
-      // This uses Atomics.wait which is allowed on Workers (not main thread)
       if (Atomics.load(waiter.flag, 0) === 0) {
         Atomics.wait(waiter.flag, 0, 0, 30000); // 30s timeout
+      }
+
+      // Read exit code from SAB (set by main thread before notify)
+      if (statusPtr) {
+        const exitCode = Atomics.load(waiter.flag, 1);
+        new DataView(memory.buffer).setInt32(statusPtr, exitCode, true);
       }
 
       pendingWaits.delete(pid);

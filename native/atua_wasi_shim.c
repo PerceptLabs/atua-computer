@@ -303,7 +303,14 @@ __wasi_errno_t __wasi_environ_sizes_get(__wasi_size_t *count, __wasi_size_t *buf
     return atua_environ_sizes_get(count, buf_size);
 }
 
+/* Exit code storage — JS reads via exported get_exit_code() */
+static uint32_t _exit_code = 0;
+
+__attribute__((export_name("get_exit_code")))
+uint32_t get_exit_code(void) { return _exit_code; }
+
 _Noreturn void __wasi_proc_exit(__wasi_exitcode_t code) {
+    _exit_code = code;
     __builtin_trap();
 }
 

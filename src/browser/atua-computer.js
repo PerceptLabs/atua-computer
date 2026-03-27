@@ -109,10 +109,11 @@ export class AtuaComputer {
       } else if (ce.data.type === 'exit') {
         // Signal parent Worker that child exited
         this._worker.postMessage({ type: 'child-exit', pid: ce.data.pid, code: ce.data.code });
-        // Also set the SAB flag directly
+        // Store exit code and set flag in SAB — parent reads from SAB directly
         if (waitFlag) {
           const view = new Int32Array(waitFlag);
-          Atomics.store(view, 0, 1);
+          Atomics.store(view, 1, ce.data.code || 0); // exit code at index 1
+          Atomics.store(view, 0, 1); // done flag at index 0
           Atomics.notify(view, 0);
         }
         this._children.delete(pid);

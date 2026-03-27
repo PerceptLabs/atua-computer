@@ -57,7 +57,7 @@ int flock(int fd, int operation) { errno = 38; return -1; }
 void __wasm_init_tls(void *mem) { (void)mem; }
 long syscall(long num, ...) { (void)num; errno = 38; return -1; }
 int sockatmark(int fd) { (void)fd; return 0; }
-void GetRandom(void *buf, size_t len, int flags) { (void)flags; memset(buf, 0x42, len); }
+int GetRandom(void *buf, size_t len, int flags) { (void)flags; memset(buf, 0x42, len); return len; }
 int sched_getaffinity(int pid, size_t size, void *set) { (void)pid; memset(set, 0xff, size); return 0; }
 int sched_setaffinity(int pid, size_t size, const void *set) { (void)pid; (void)size; (void)set; return 0; }
 int __sched_cpucount(size_t size, const void *set) { (void)size; (void)set; return 1; }
@@ -75,7 +75,7 @@ ${CC} --target=wasm32-wasip1 --sysroot=${WASIX_SYSROOT} -D_WASI_EMULATED_SIGNAL 
 echo "=== Building archive ==="
 ${AR} rcs "${BUILD_DIR}/libblink.a" ${BUILD_DIR}/*.o
 # Remove objects that conflict with stubs or are replaced by blink.o
-${AR} d "${BUILD_DIR}/libblink.a" blink.o browser_stubs.o ioctl.o 2>/dev/null || true
+${AR} d "${BUILD_DIR}/libblink.a" blink.o browser_stubs.o ioctl.o random.o 2>/dev/null || true
 
 echo "=== Linking ==="
 ${WASI_SDK}/bin/wasm-ld \

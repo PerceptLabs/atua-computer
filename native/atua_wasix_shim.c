@@ -18,13 +18,20 @@ typedef uint32_t __wasi_size_t;
 #define E_NOSYS   52
 
 /* proc_exit2 — used by crt1.o */
+extern uint32_t get_exit_code(void);
+extern void __wasi_proc_exit(uint32_t code);
 _Noreturn void __wasi_proc_exit2(int code) {
-    __builtin_trap();
+    __wasi_proc_exit(code); /* sets _exit_code then traps */
 }
 
 /* proc_id / proc_parent */
 __wasi_errno_t __wasi_proc_id(uint32_t *pid) { *pid = 1; return E_SUCCESS; }
-__wasi_errno_t __wasi_proc_parent(uint32_t *ppid) { *ppid = 0; return E_SUCCESS; }
+/* getppid.o expects: (pid, *retptr0) → errno */
+__wasi_errno_t __wasi_proc_parent(uint32_t pid, uint32_t *retptr0) {
+    (void)pid;
+    if (retptr0) *retptr0 = 0;
+    return E_SUCCESS;
+}
 
 /* tty stubs */
 __wasi_errno_t __wasi_tty_get(void *tty_state) { return E_NOSYS; }
@@ -34,23 +41,38 @@ __wasi_errno_t __wasi_tty_set(const void *tty_state) { return E_NOSYS; }
 __wasi_errno_t __wasi_getcwd(uint8_t *path, __wasi_size_t *path_len) { return E_NOSYS; }
 __wasi_errno_t __wasi_chdir(const char *path) { return E_NOSYS; }
 
-/* fd operations — Blink handles internally */
-__wasi_errno_t __wasi_fd_dup(__wasi_fd_t fd, __wasi_fd_t *retfd) { return E_NOSYS; }
-__wasi_errno_t __wasi_fd_dup2(__wasi_fd_t fd, __wasi_fd_t newfd) { return E_NOSYS; }
+/* fd operations — HOST-level dup/dup2 for wasi-libc internal use.
+ * GUEST dup/dup2 go through Blink's SysDup2 which calls VfsDup2.
+ * These need to work because Blink calls dup2 on HOST fds during init. */
+static __wasi_fd_t next_dup_fd = 100;
+
+__wasi_errno_t __wasi_fd_dup(__wasi_fd_t fd, __wasi_fd_t *retfd) {
+    *retfd = next_dup_fd++;
+    return E_SUCCESS;
+}
+
+/* fcntl.o expects: (fd, min_result_fd, cloexec, *retfd) → errno */
+__wasi_errno_t __wasi_fd_dup2(__wasi_fd_t fd, __wasi_fd_t min_result_fd,
+                               uint32_t cloexec, __wasi_fd_t *retfd) {
+    if (retfd) *retfd = min_result_fd;
+    return E_SUCCESS;
+}
+
 __wasi_errno_t __wasi_fd_pipe(__wasi_fd_t *fd0, __wasi_fd_t *fd1) { return E_NOSYS; }
 __wasi_errno_t __wasi_fd_event(uint64_t initial, uint16_t flags, __wasi_fd_t *retfd) { return E_NOSYS; }
 __wasi_errno_t __wasi_fd_fdflags_get(__wasi_fd_t fd, uint16_t *flags) { *flags = 0; return E_SUCCESS; }
 __wasi_errno_t __wasi_fd_fdflags_set(__wasi_fd_t fd, uint16_t flags) { return E_SUCCESS; }
 
-/* path_open2 — wasix extension of path_open */
+/* path_open2 — openat.o expects: (dirfd, dirflags, path, oflags, rights_base, rights_inheriting, fdflags, fdflagsext, *retfd) */
 __wasi_errno_t __wasi_path_open2(__wasi_fd_t dirfd, uint32_t dirflags,
-                                 const char *path, uint32_t path_len,
-                                 uint16_t oflags, uint64_t fs_rights_base,
+                                 const char *path, uint32_t oflags,
+                                 uint64_t fs_rights_base,
                                  uint64_t fs_rights_inheriting,
-                                 uint16_t fdflags, __wasi_fd_t *retfd) { return E_NOSYS; }
+                                 uint16_t fdflags, uint16_t fdflagsext,
+                                 __wasi_fd_t *retfd) { return E_NOSYS; }
 
-/* callback / signal */
-__wasi_errno_t __wasi_callback_signal(void *callback) { return E_NOSYS; }
+/* callback / signal — block.o expects: (callback) → void */
+void __wasi_callback_signal(void *callback) { (void)callback; }
 
 /* thread */
 __wasi_errno_t __wasi_thread_parallelism(uint32_t *parallelism) { *parallelism = 1; return E_SUCCESS; }
@@ -71,7 +93,10 @@ __wasi_errno_t __wasi_proc_fork(void) { return E_NOSYS; }
 __wasi_errno_t __wasi_proc_fork_env(void *env, uint32_t env_len) { return E_NOSYS; }
 __wasi_errno_t __wasi_proc_exec(const char *path, const void *args, uint32_t args_len) { return E_NOSYS; }
 __wasi_errno_t __wasi_proc_exec2(const char *path, uint32_t path_len, const void *args, uint32_t args_len) { return E_NOSYS; }
-__wasi_errno_t __wasi_proc_exec3(const char *path, uint32_t path_len, const void *args, uint32_t args_len) { return E_NOSYS; }
+/* execvp.o expects: (path, path_len, args, args_len, preopen_fd) → errno */
+__wasi_errno_t __wasi_proc_exec3(const char *path, uint32_t path_len,
+                                  const void *args, uint32_t args_len,
+                                  __wasi_fd_t preopen_fd) { return E_NOSYS; }
 __wasi_errno_t __wasi_proc_spawn(const char *path, uint32_t path_len, const void *args, uint32_t args_len,
                                  __wasi_fd_t stdin_fd, __wasi_fd_t stdout_fd, __wasi_fd_t stderr_fd,
                                  uint32_t *pid) { return E_NOSYS; }
@@ -80,7 +105,13 @@ __wasi_errno_t __wasi_proc_spawn2(const char *path, uint32_t path_len, const voi
                                   const char *workdir, uint32_t workdir_len, void *flags, uint32_t *pid) { return E_NOSYS; }
 __wasi_errno_t __wasi_proc_join(const uint32_t *pids, uint32_t pids_len, void *status) { return E_NOSYS; }
 __wasi_errno_t __wasi_proc_signal(uint32_t pid, uint32_t signal) { return E_NOSYS; }
-__wasi_errno_t __wasi_proc_raise_interval(uint64_t interval) { return E_NOSYS; }
+/* setitimer.o expects: (sig, interval_ns, *old_interval) → errno */
+__wasi_errno_t __wasi_proc_raise_interval(uint32_t sig, uint64_t interval_ns,
+                                           uint32_t *old_interval) {
+    (void)sig; (void)interval_ns;
+    if (old_interval) *old_interval = 0;
+    return E_NOSYS;
+}
 __wasi_errno_t __wasi_proc_signals_get(void *signals) { return E_SUCCESS; }
 __wasi_errno_t __wasi_proc_signals_sizes_get(uint32_t *count) { *count = 0; return E_SUCCESS; }
 __wasi_errno_t __wasi_proc_snapshot(void) { return E_NOSYS; }
