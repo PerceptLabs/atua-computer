@@ -133,13 +133,15 @@ static void test_dup2(void) {
 
     int oldfd = dup(1); /* save stdout */
     int rc = dup2(pipefd[1], 1); /* redirect stdout to pipe */
-    TEST("dup2(pipe, stdout)", rc == 1);
+    /* stdout is now redirected — don't use printf/TEST until restored */
 
     if (rc == 1) {
         write(1, "DUP2OK", 6);
         dup2(oldfd, 1); /* restore stdout */
         close(oldfd);
         close(pipefd[1]);
+
+        TEST("dup2(pipe, stdout)", 1);
 
         char buf[64];
         ssize_t nr = read(pipefd[0], buf, sizeof(buf));
@@ -148,6 +150,7 @@ static void test_dup2(void) {
         dup2(oldfd, 1);
         close(oldfd);
         close(pipefd[1]);
+        TEST("dup2(pipe, stdout)", 0);
     }
     close(pipefd[0]);
 }
