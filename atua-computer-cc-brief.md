@@ -190,7 +190,7 @@ Each phase builds on real, tested behavior from the previous phase. Do NOT skip 
 
 - Hot basic block detection
 - x86→WASM translator for top ~25 instructions
-- Compilation via @wasmer/sdk module compilation API
+- Compilation via browser-native WebAssembly.compile() API
 - Dispatch patching with page-level invalidation
 - **Real test:** Measured speedup on gcc, python, node benchmarks. No correctness regressions.
 

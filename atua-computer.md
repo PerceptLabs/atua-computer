@@ -4,7 +4,7 @@
 
 ## Why This Exists
 
-The current `atua-node` direction in this repo is a compatibility-layer strategy: vendored Node.js JavaScript, `internalBinding()` shims, WASIX-backed libraries, host bridges, and package-compat work. That can move compatibility materially forward, but it still spends most of its effort emulating a runtime above a browser substrate that is not actually Linux or Node.
+The current `atua-node` direction in this repo is a compatibility-layer strategy: vendored Node.js JavaScript, `internalBinding()` shims, WASM-backed libraries, host bridges, and package-compat work. That can move compatibility materially forward, but it still spends most of its effort emulating a runtime above a browser substrate that is not actually Linux or Node.
 
 `atua-computer` changes the framing. The goal is not "approximate Node in-browser" but "run real Linux userland software in-browser under a browser-native host." The target user experience is:
 
@@ -677,7 +677,7 @@ What `atua-computer` should reuse:
 
 What `atua-computer` should not inherit as architectural constraints:
 
-- WASIX as the execution substrate
+- A specific WASM runtime SDK as the execution substrate
 - vendored Node.js internals as the main runtime strategy
 - Node compatibility routing as the primary product abstraction
 

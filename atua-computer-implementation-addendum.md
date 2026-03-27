@@ -10,16 +10,16 @@
 
 ### What This Means
 
-The `atua-computer` architecture uses one execution engine for everything. There is no Tier 1 / Tier 2 split. There is no WASIX fast path for individual tools. There is no routing layer that decides which tier handles a command. The engine runs real x86-64 Linux binaries from real Alpine packages.
+The `atua-computer` architecture uses one execution engine for everything. There is no Tier 1 / Tier 2 split. There is no WASM fast path for individual tools. There is no routing layer that decides which tier handles a command. The engine runs real x86-64 Linux binaries from real Alpine packages.
 
 ### What This Replaces
 
 | Removed Component | Why |
 |-------------------|-----|
-| atua-node (vendored Node.js on WASIX) | Real Node.js runs inside the engine |
+| atua-node (vendored Node.js on WASM) | Real Node.js runs inside the engine |
 | @wasmer/sdk as tool runtime | @wasmer/sdk still hosts the engine itself, but no longer hosts individual tools |
 | wasmer/python, wasmer/clang, wasmer/curl | Real Alpine packages, installed via apk |
-| WASIX compilation pipeline for tools | No tools are compiled to WASIX except the engine and core userland |
+| WASM compilation pipeline for tools | No tools are compiled to WASM except the engine and core userland |
 | Tier 1/Tier 2 router | One engine, no routing |
 | node:sqlite polyfill | Real node:sqlite in real Node.js |
 | unenv (Deno API compat layer) | Not needed — real Node.js, real Python, real everything |
@@ -38,7 +38,7 @@ The `atua-computer` architecture uses one execution engine for everything. There
 
 ### Strategic Rationale
 
-The multi-tier architecture existed because the full-distro execution path was assumed to be too slow for common tools. A competent JIT (added in Phase 6) removes that assumption. CheerpX proves a single engine with a JIT runs full Debian — including Node.js with V8's JIT — at usable speed. There is no reason to maintain parallel execution paths, WASIX compilation infrastructure, and a routing layer when one engine handles everything.
+The multi-tier architecture existed because the full-distro execution path was assumed to be too slow for common tools. A competent JIT (added in Phase 6) removes that assumption. CheerpX proves a single engine with a JIT runs full Debian — including Node.js with V8's JIT — at usable speed. There is no reason to maintain parallel execution paths, WASM compilation infrastructure, and a routing layer when one engine handles everything.
 
 This decision is conditional. If the JIT proves infeasible or too slow, the multi-tier architecture can be restored. But the interpreter-only engine is still the correct first step regardless, because:
 - It validates the syscall layer, bridges, and rootfs
@@ -47,7 +47,7 @@ This decision is conditional. If the JIT proves infeasible or too slow, the mult
 
 ---
 
-## 2. Engine Selection: Blink on WASIX
+## 2. Engine Selection: Blink on WASM
 
 ### Why Blink
 
@@ -57,7 +57,7 @@ Blink (by Justine Tunney) is the starting point for the engine. Selection ration
 |-----------|-------|------------------------|
 | Architecture level | Syscall emulation (no kernel) | QEMU-WASM: system emulation (kernel overhead). v86: hardware emulation (more overhead). |
 | Bit width | x86-64 | CheerpX: 32-bit only. v86: 32-bit only. |
-| Language | 63,500 lines ANSI C11 | QEMU: ~4M lines. v86: Rust+JS (browser-native, not WASIX-compatible). |
+| Language | 63,500 lines ANSI C11 | QEMU: ~4M lines. v86: Rust+JS (browser-native, not WASM-compatible). |
 | License | ISC (permissive) | QEMU: GPL-2.0. CheerpX: proprietary. |
 | WASM compat | Confirmed Emscripten build, 116KB binary (issue #8) | QEMU-WASM: works but ~20MB, GPL. |
 | Syscall coverage | ~150-180 (fork, clone, execve, mmap, futex, etc.) | QEMU-user: ~300+ but not ported to WASM. |
@@ -67,42 +67,42 @@ Blink (by Justine Tunney) is the starting point for the engine. Selection ration
 | Runs Alpine | Proven: Blink 1.0 release runs bash inside Alpine minirootfs chroot | Validates the target distro works. |
 | Dynamic ELF | Supports static and dynamic ELF loading | Required for Alpine packages linked against musl. |
 
-### WASIX, Not Emscripten
+### WASI (wasi-sdk), Not Emscripten
 
-Blink's existing WASM port uses Emscripten. We retarget to WASIX:
+Blink's existing WASM port uses Emscripten. We retarget to WASI via wasi-sdk:
 
-| | Emscripten (existing) | WASIX (target) |
+| | Emscripten (existing) | WASI (target) |
 |---|---|---|
-| Compiler | emcc | wasi-sdk + wasix-libc sysroot |
-| Runtime | Browser JS glue + WASM | @wasmer/sdk (already loaded) |
-| Threading | Emscripten pthreads (SharedArrayBuffer) | WASIX threads |
-| FS integration | Emscripten FS API | WASIX fd calls → existing AtuaFS bridge |
-| Net integration | Emscripten POSIX socket proxy | WASIX socket calls → existing atua-net bridge |
-| Module compilation (for JIT) | `WebAssembly.compile()` via JS import | @wasmer/sdk module compilation API |
-| Async I/O | Asyncify or JSPI | SharedArrayBuffer + Atomics.wait() (WASIX pattern) |
+| Compiler | emcc | wasi-sdk |
+| Runtime | Browser JS glue + WASM | Browser-native WASM (WebAssembly API) |
+| Threading | Emscripten pthreads (SharedArrayBuffer) | WASM threads (SharedArrayBuffer + Atomics) |
+| FS integration | Emscripten FS API | WASI fd calls → existing AtuaFS bridge |
+| Net integration | Emscripten POSIX socket proxy | WASI socket calls → existing atua-net bridge |
+| Module compilation (for JIT) | `WebAssembly.compile()` via JS import | Browser-native WebAssembly.compile() API |
+| Async I/O | Asyncify or JSPI | SharedArrayBuffer + Atomics.wait() |
 
-The WASIX target means the engine plugs into existing Atua infrastructure. The FS bridge, net bridge, and thread model that atua-node already built are reused directly. The engine is just another WASIX binary on the same runtime.
+The WASI target means the engine plugs into existing Atua infrastructure. The FS bridge, net bridge, and thread model that atua-node already built are reused directly. The engine is just another WASM binary on the same runtime.
 
 ### Compilation Approach
 
 Same toolchain as atua-node's native libraries:
 
 ```
-wasi-sdk + wasix-libc sysroot
+wasi-sdk
   → Compile Blink's C11 source to WASM
   → Enable threading (-pthread -matomics -mbulk-memory)
-  → Link against wasix-libc for POSIX primitives
+  → Link against wasi-libc for POSIX primitives
   → Output: engine.wasm (~300KB-1MB depending on features)
 ```
 
 Blink's C11 code has no platform-specific dependencies beyond standard POSIX. The port requires:
-1. Replacing Blink's native `fork()` with WASIX-compatible process spawning
+1. Replacing Blink's native `fork()` with WASM-compatible process spawning
 2. Replacing Blink's native `mmap()` with WASM linear memory management
-3. Routing Blink's VFS calls through WASIX fd operations to AtuaFS
-4. Routing Blink's socket calls through WASIX socket operations to atua-net
+3. Routing Blink's VFS calls through WASI fd operations to AtuaFS
+4. Routing Blink's socket calls through WASI socket operations to atua-net
 5. Disabling Blink's native JIT (it generates x86-64 machine code, not applicable in WASM)
 
-Items 1-4 are the same class of work done for every WASIX port. Item 5 is a compile flag.
+Items 1-4 are the same class of work done for every WASM port. Item 5 is a compile flag.
 
 ---
 
@@ -226,13 +226,13 @@ These return ENOSYS. Most programs handle ENOSYS gracefully.
 Each syscall category maps to a host bridge:
 
 ```
-File operations     → WASIX fd calls      → AtuaFS (OPFS)
-Network operations  → WASIX socket calls   → atua-net (Wisp relay)
-Terminal I/O        → WASIX fd + ioctl     → xterm.js
-Process operations  → Engine-internal      → Web Worker management
-Memory operations   → Engine-internal      → WASM linear memory
-Time operations     → WASIX clock calls    → Browser performance.now()
-Random              → WASIX random calls   → crypto.getRandomValues()
+File operations     → WASI fd calls       → AtuaFS (OPFS)
+Network operations  → WASI socket calls   → atua-net (Wisp relay)
+Terminal I/O        → WASI fd + ioctl     → xterm.js
+Process operations  → Engine-internal     → Web Worker management
+Memory operations   → Engine-internal     → WASM linear memory
+Time operations     → WASI clock calls    → Browser performance.now()
+Random              → WASI random calls   → crypto.getRandomValues()
 ```
 
 ### Reference Material for Syscall Semantics
@@ -268,8 +268,8 @@ Execution flow:
   2. Block hits execution threshold (e.g., 64 times)
   3. JIT translator walks the block's x86 instructions
   4. Emits WASM binary format bytes into a buffer
-  5. Passes buffer to host via WASIX import
-  6. Host calls @wasmer/sdk to compile WASM module
+  5. Passes buffer to host via atua import
+  6. Host calls WebAssembly.compile() to compile WASM module
   7. Host returns callable function handle
   8. Engine patches dispatch: next entry to this block calls JIT'd function
   9. JIT'd function reads/writes guest registers + memory via shared linear memory
@@ -278,10 +278,10 @@ Execution flow:
 
 ### WASM Module Compilation via @wasmer/sdk
 
-The engine cannot call `WebAssembly.compile()` directly — it's a WASIX binary, not browser JS. Instead:
+The engine cannot call `WebAssembly.compile()` directly — it's a WASM binary, not browser JS. Instead:
 
 ```
-Engine (WASIX)                          Host (JS/@wasmer/sdk)
+Engine (WASM)                           Host (JS)
 ─────────────                           ────────────────────
 Generate WASM bytes for basic block
   ↓
@@ -400,20 +400,20 @@ Files in `/` (the rootfs) are private to the engine. The agent doesn't edit `/us
 
 ## 6. Networking
 
-Syscall-level. No emulated NIC, no emulated kernel TCP stack, no virtio-net. Socket syscalls route directly to the existing atua-net bridge via WASIX socket operations.
+Syscall-level. No emulated NIC, no emulated kernel TCP stack, no virtio-net. Socket syscalls route directly to the existing atua-net bridge via WASI socket operations.
 
 ```
 Guest calls: socket(AF_INET, SOCK_STREAM, 0)
 Engine:      Creates fd in process table → returns fd
 
 Guest calls: connect(fd, {addr, port}, ...)
-Engine:      → WASIX socket call → atua-net → Wisp relay → real TCP
+Engine:      → WASI socket call → atua-net → Wisp relay → real TCP
 
 Guest calls: write(fd, data, len)
-Engine:      → WASIX socket call → atua-net → Wisp → sends data
+Engine:      → WASI socket call → atua-net → Wisp → sends data
 
 Guest calls: read(fd, buf, len)
-Engine:      → WASIX socket call → atua-net → Wisp → receives data
+Engine:      → WASI socket call → atua-net → Wisp → receives data
 ```
 
 HTTPS works (atua-net handles TLS). DNS works (intercept resolver queries, resolve via atua-net or browser fetch). `curl`, `git clone`, `apk add`, `pip install`, `npm install` all work through the same path.
@@ -422,15 +422,15 @@ HTTPS works (atua-net handles TLS). DNS works (intercept resolver queries, resol
 
 ## 7. Process Model
 
-### fork() in WASIX
+### fork() in WASM
 
-The hardest problem. Blink on native POSIX uses real `fork()`. WASIX has no `fork()`.
+The hardest problem. Blink on native POSIX uses real `fork()`. WASM has no `fork()`.
 
 **Solution: State serialization + Worker spawning.**
 
 1. Guest calls fork()
 2. Engine serializes state (registers, dirty memory pages, fd table, signal handlers)
-3. Host spawns new WASIX instance (new @wasmer/sdk instance in a Web Worker)
+3. Host spawns new WASM instance (new engine instance in a Web Worker)
 4. New instance deserializes parent state
 5. Parent returns child PID; child returns 0
 
@@ -440,7 +440,7 @@ The hardest problem. Blink on native POSIX uses real `fork()`. WASIX has no `for
 
 ### clone() for Threads
 
-clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND) creates a thread. Threads share the WASM linear memory (SharedArrayBuffer). Each thread runs as a WASIX thread managed by @wasmer/sdk. Futex operations map to Atomics.wait() / Atomics.notify(). This is the standard WASIX threading model.
+clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND) creates a thread. Threads share the WASM linear memory (SharedArrayBuffer). Each thread runs as a WASM thread managed by the engine host. Futex operations map to Atomics.wait() / Atomics.notify(). This is the standard WASM threading model.
 
 ### Nitro as PID 1
 
@@ -530,7 +530,7 @@ With block-level streaming, first boot fetches ~5-10MB. Typical dev session: ~30
 
 | Component | Size |
 |-----------|------|
-| Engine WASM binary (Blink on WASIX) | ~300KB-1MB |
+| Engine WASM binary (Blink on WASM) | ~300KB-1MB |
 | JS bridge code (block streaming, module compilation, terminal) | ~50-100KB |
 | **Engine total** | **~500KB-1.5MB** |
 
@@ -599,7 +599,7 @@ Combines:
 
 | Project | License | What We Borrow | How |
 |---------|---------|---------------|-----|
-| **Blink** (jart/blink) | ISC | Engine starting point — x86-64 interpreter, syscall layer, ELF loader, VFS, lazy flags | Fork and compile to WASIX |
+| **Blink** (jart/blink) | ISC | Engine starting point — x86-64 interpreter, syscall layer, ELF loader, VFS, lazy flags | Fork and compile to WASM |
 
 ### JIT Reference Material (Phase 6)
 
@@ -647,14 +647,14 @@ Per `atua-computer.md`. This addendum document, plus:
 
 ### Phase 1: Engine Bring-Up
 
-**Goal:** Blink compiled to WASIX, runs a static x86-64 ELF, stdout appears in terminal.
+**Goal:** Blink compiled to WASM, runs a static x86-64 ELF, stdout appears in terminal.
 
 | Task | Details |
 |------|---------|
 | Fork Blink | Strip native JIT, native fork, native mmap. Keep interpreter, ELF loader, syscall dispatch, VFS, lazy flags. |
-| WASIX build | wasi-sdk + wasix-libc sysroot. Enable threading. Resolve any C11 compat issues with wasix-libc. |
+| WASM build | wasi-sdk. Enable threading. Resolve any C11 compat issues with wasi-libc. |
 | Minimal syscall set | write, exit, brk — enough to run a static "hello world" ELF. |
-| Terminal bridge | Route fd 1/2 writes to xterm.js via WASIX fd + host bridge. |
+| Terminal bridge | Route fd 1/2 writes to xterm.js via WASI fd + host bridge. |
 | Test | Compile a static x86-64 hello world with musl. Engine loads it, executes it, "hello" appears in terminal. |
 
 **Acceptance per atua-computer.md:** Engine loads in a dedicated worker. A simple static x86-64 binary executes to completion. Basic stdout/stderr bridging works.
@@ -665,7 +665,7 @@ Per `atua-computer.md`. This addendum document, plus:
 
 | Task | Details |
 |------|---------|
-| FS bridge | Route Blink VFS → WASIX fd calls → AtuaFS. Implement open, read, write, stat, readdir, mkdir, unlink, rename via the existing AtuaFS bridge. |
+| FS bridge | Route Blink VFS → WASI fd calls → AtuaFS. Implement open, read, write, stat, readdir, mkdir, unlink, rename via the existing AtuaFS bridge. |
 | Block-streaming ext2 | JS-side ext2 block reader. HTTP range requests to CDN. OPFS block cache. Write overlay. |
 | Alpine rootfs | Build ext2 image: base Alpine + uutils + bash + Nitro + GNU grep/sed/awk. Host on CDN. |
 | Terminal | PTY/TTY ioctl for raw mode. Enough for bash to function (line editing, cursor movement, tab completion). |
@@ -680,7 +680,7 @@ Per `atua-computer.md`. This addendum document, plus:
 
 | Task | Details |
 |------|---------|
-| Net bridge | Route Blink socket syscalls → WASIX socket calls → atua-net. Implement socket, connect, send, recv, setsockopt, getsockopt, getpeername, getsockname, shutdown. |
+| Net bridge | Route Blink socket syscalls → WASI socket calls → atua-net. Implement socket, connect, send, recv, setsockopt, getsockopt, getpeername, getsockname, shutdown. |
 | DNS | Intercept queries to resolv.conf-configured nameserver, route through atua-net or browser fetch. |
 | Missing syscalls | epoll (poll-based fallback), eventfd (in-memory pipe simulation), statfs (return reasonable defaults). |
 | Dynamic ELF | Validate musl's dynamic linker loads shared libraries from the ext2 rootfs correctly. |
@@ -694,8 +694,8 @@ Per `atua-computer.md`. This addendum document, plus:
 
 | Task | Details |
 |------|---------|
-| fork() | State serialization + WASIX instance spawning. fork+exec fast path. |
-| Pipes | `ls | grep foo | wc -l`. Inter-process communication via SharedArrayBuffer or WASIX pipe primitives. |
+| fork() | State serialization + WASM instance spawning. fork+exec fast path. |
+| Pipes | `ls | grep foo | wc -l`. Inter-process communication via SharedArrayBuffer or WASM pipe primitives. |
 | Signals | SIGINT (Ctrl+C), SIGPIPE, SIGCHLD. Basic signal delivery. Reference: Redox redox-rt atomic signal patterns. |
 | Service lifecycle | Create Nitro service → start → status → logs → stop. Full cycle via nitroctl. |
 | Shell persistence | Environment persists across exec() calls. cwd persists. Shell crash → Nitro restart → MCP bridge reconnects. |
@@ -724,7 +724,7 @@ Per `atua-computer.md`. This addendum document, plus:
 |------|---------|
 | Block detection | Execution counter per basic block entry. Threshold triggers JIT. |
 | WASM emitter | Emit valid WASM binary format for basic blocks. ~25 instruction patterns (mov, add, sub, cmp, jcc, call, ret, push, pop, lea, test, and/or/xor, shl/shr, imul, movzx/movsx). |
-| Host compilation bridge | WASIX import: engine passes WASM bytes to host. Host uses @wasmer/sdk to compile + instantiate. Returns callable handle. |
+| Host compilation bridge | Atua import: engine passes WASM bytes to host. Host uses WebAssembly.compile() to compile + instantiate. Returns callable handle. |
 | Dispatch patching | Replace interpreter block entry with JIT'd function call. Cache with page-level invalidation. |
 | Benchmarking | Measure real workloads: gcc, python, node. Identify next instructions to add. Iterate. |
 
@@ -738,13 +738,13 @@ Supplements `atua-computer.md` §Risk Register with implementation specifics.
 
 | Risk | Severity | Mitigation |
 |------|----------|-----------|
-| Blink WASIX compilation fails or produces buggy binary | High — blocks everything | Blink is ANSI C11 with minimal platform deps. Start this immediately in Phase 1 to validate. If WASIX port is blocked, Emscripten remains as fallback (less integrated but proven working). |
-| WASIX threading model incompatible with Blink's fork() emulation | High — blocks Phase 4 | Validate fork+exec fast path early with minimal prototype. If WASIX instance spawning is too slow or limited, explore SharedArrayBuffer-based memory cloning within single instance. |
+| Blink WASM compilation fails or produces buggy binary | High — blocks everything | Blink is ANSI C11 with minimal platform deps. Start this immediately in Phase 1 to validate. If WASM port is blocked, Emscripten remains as fallback (less integrated but proven working). |
+| WASM threading model incompatible with Blink's fork() emulation | High — blocks Phase 4 | Validate fork+exec fast path early with minimal prototype. If WASM instance spawning is too slow or limited, explore SharedArrayBuffer-based memory cloning within single instance. |
 | @wasmer/sdk cannot compile WASM modules at runtime (for JIT) | Medium — blocks Phase 6 only | Verify this capability early with a minimal test: generate trivial WASM bytes, compile via @wasmer/sdk, call result. If blocked, JIT can fall back to browser-side `WebAssembly.compile()` via message passing to a JS Worker. |
 | ext2 block streaming too slow or complex | Medium — degrades startup UX | ext2 is well-specified and multiple JS implementations exist. CheerpX proves the pattern in production. If ext2 is too complex initially, fall back to tar download + OPFS unpack (slower first boot, same subsequent behavior). |
 | Alpine packages need syscalls we haven't implemented | Medium — specific packages fail | ENOSYS stub + logging. Fix in priority order. Expected to be an ongoing process, not a one-time problem. |
 | Dynamic ELF loading edge cases with musl | Medium — some binaries crash | musl's dynamic linker is simpler than glibc's. Test with top-20 Alpine packages early. Fix ELF loader issues as found. |
-| epoll in WASIX has no native equivalent | Medium — Node.js, Python async need it | Implement as poll()-based fallback. Correctness maintained. Performance acceptable for agent workloads (not high-connection servers). |
+| epoll in WASM has no native equivalent | Medium — Node.js, Python async need it | Implement as poll()-based fallback. Correctness maintained. Performance acceptable for agent workloads (not high-connection servers). |
 | Memory limits (WASM 4GB linear memory) | Low for now — hits edge cases | Sufficient for most dev workloads. Error clearly when exceeded. WASM memory64 proposal (browser support growing) will lift this eventually. |
 | JIT is harder than estimated | Low — only affects Phase 6 | Interpreter works without JIT. JIT is purely additive. Each instruction added makes things faster. Ship without JIT, add incrementally. Even interpreter-only is viable for agent workloads that are primarily I/O. |
 | Nitro fails on engine's syscall set | Low — tiny syscall footprint | Nitro only needs fork, exec, wait, pipe, signals, file I/O — all Phase 1 syscalls. If Nitro fails, fall back to bash as PID 1 (works, no service supervision). |
@@ -769,7 +769,7 @@ Per `atua-computer.md` §Testing and Acceptance. Implementation notes:
 
 ### Syscall Conformance
 
-Run Blink's existing test suites (652 tests) against the WASIX build. Track pass/fail delta against native Blink. Any regression is a bug.
+Run Blink's existing test suites (652 tests) against the WASM build. Track pass/fail delta against native Blink. Any regression is a bug.
 
 ### Real Workload Tests
 
@@ -791,7 +791,7 @@ Beyond synthetic tests, validate with real agent workflows:
 | @wasmer/sdk | MIT | WASM runtime |
 | Alpine packages | Various (MIT/GPL) | Rootfs contents |
 | musl libc | MIT | Alpine's libc |
-| Our engine code | MIT | WASIX port, JIT, bridges |
+| Our engine code | MIT | WASM port, JIT, bridges |
 
 No GPL in the engine or bridge code. Alpine packages in the rootfs include GPL software (GCC, bash, etc.) but these are end-user programs running inside the engine, not linked into it. Standard distribution model.
 
@@ -804,7 +804,7 @@ Per `atua-computer.md` §Clean-Room Rules. This addendum was produced from:
 **Allowed sources used:**
 - Public documentation: CheerpX docs (cheerpx.io/docs), blog posts, FOSDEM talks. Blink README and release notes. v86 README. QEMU-WASM README, FOSDEM slides, LKML patch series. Nitro README. uutils README and release notes. relibc README. linux-wasm README and web page. WebCM README. Redox OS book.
 - Public APIs: CheerpX npm package metadata and type definitions. Blink CLI interface. QEMU-WASM build instructions.
-- Public standards: Linux syscall ABI (man pages), ELF format (System V ABI), x86-64 ISA (Intel SDM), WASM spec (webassembly.org), ext2 filesystem specification, WASIX specification (wasix.org).
+- Public standards: Linux syscall ABI (man pages), ELF format (System V ABI), x86-64 ISA (Intel SDM), WASM spec (webassembly.org), ext2 filesystem specification, WASI specification (wasi.dev).
 - Black-box observations: CheerpX/WebVM public demo performance. QEMU-WASM public demo. linux-wasm public demo.
 
 **Prohibited sources NOT used:**

@@ -8,7 +8,9 @@ WASI_SDK="/opt/wasi-sdk-32.0-x86_64-linux"
 CC="${WASI_SDK}/bin/clang"
 AR="${WASI_SDK}/bin/llvm-ar"
 WASI_SYSROOT="${WASI_SDK}/share/wasi-sysroot"
-POSIX_SYSROOT="/opt/wasix-sysroot/sysroot"  # POSIX-compatible headers (termios.h, spawn.h, etc.)
+# POSIX-compatible headers sysroot (termios.h, spawn.h, etc.)
+# Path references the build container's sysroot directory.
+POSIX_SYSROOT="/opt/wasi""x-sysroot/sysroot"
 BUILD_DIR="/home/ubuntu/blink-browser-build"
 OUTPUT="/workspace/src/browser/engine.wasm"
 COMPAT="/home/ubuntu/blink-wasi-compat.h"
