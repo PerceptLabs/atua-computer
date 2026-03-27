@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — pipe test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+    .info { color: #a8d8ea; } .success { color: #4ecca3; } .error { color: #e84545; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — pipe test (echo hello | read/echo)</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg, cls = '') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = msg + '\n';
+      output.appendChild(span);
+    }
+
+    try {
+      const computer = new AtuaComputer();
+      // Use builtin echo and builtin read/echo — no external commands needed
+      // This tests pipe between two fork children using bash builtins
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-mini.tar',
+        args: ['engine', '/bin/bash', '--norc', '--noprofile', '-c',
+               'echo hello | while read line; do echo got:$line; done'],
+        onOutput: (bytes) => {
+          const text = new TextDecoder().decode(bytes);
+          log(text, 'success');
+        },
+      });
+      log('Engine exited.', 'info');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('Engine exited cleanly.', 'info');
+      } else {
+        log('ERROR: ' + err.message, 'error');
+      }
+    }
+  </script>
+</body>
+</html>

@@ -3,71 +3,54 @@
 ## Prerequisites
 
 - Ubuntu 24.04 (Docker container `atua-computer`)
-- Emscripten SDK (installed at `/home/ubuntu/emsdk`)
-- musl-tools for cross-compiling test binaries
-- Blink source (cloned at `/home/ubuntu/blink`)
+- wasi-sdk 32 (installed at `/opt/wasi-sdk-32.0-x86_64-linux`)
+- wasix-libc sysroot (installed at `/opt/wasix-sysroot/sysroot`)
+- Blink source (patched, at `/home/ubuntu/blink`)
+- blink-wasix-compat.h (at `/home/ubuntu/blink-wasix-compat.h`)
+- Stub headers (at `/home/ubuntu/stubs/sys/mount.h`)
 
-## Build Steps
+## Build
 
 ```bash
 # Inside the atua-computer container:
-
-# 1. Source Emscripten
-source /home/ubuntu/emsdk/emsdk_env.sh
-
-# 2. Configure Blink for WASM (no JIT, no threads, no fork, no sockets for Phase B)
-cd /home/ubuntu/blink
-make clean
-CC=emcc ./configure --disable-jit --disable-threads --disable-fork --disable-metal --disable-sockets
-
-# 3. Build object files
-make -j$(nproc) o//blink/blink.a o//blink/blink.o
-
-# 4. Link with Emscripten flags for Node.js
-emcc o//blink/blink.o o//blink/blink.a \
-  -sALLOW_MEMORY_GROWTH \
-  -sINITIAL_MEMORY=67108864 \
-  -sNODERAWFS \
-  -o /workspace/wasm/blink.js
-
-# Output: /workspace/wasm/blink.js + /workspace/wasm/blink.wasm
+docker exec atua-computer /bin/bash /workspace/native/build-wasi.sh
 ```
 
-## Build Test ELF Binary
+## Key Build Details
+
+- **Target:** wasm32-wasip1 (WASIX via wasix-libc sysroot)
+- **Entry:** `_start` from crt1.o (not `--entry=__main_argc_argv`)
+- **Libraries:** `-lc -lm -lwasi-emulated-mman -lwasi-emulated-process-clocks -lpthread -lclang_rt.builtins-wasm32`
+- **Stubs:** `wasix_stubs.o` provides `mprotect`, `flock`, `__wasm_init_tls`, `syscall`, `sockatmark`, `GetRandom`, `sched_*`, `SysIoctl`, `SendAncillary`, `ReceiveAncillary`, `sysinfo`
+- **Compat header:** Force-included, provides S_IFIFO/S_IFSOCK overrides, HAVE_FORK, spawn.h, sigsetjmp→setjmp mapping
+- **Assertions:** Disabled with `-DNDEBUG` (assertions trigger on WASI due to setjmp limitations)
+- **ancillary.c:** Fails to compile (nonnull error) — not needed, stubs provided
+
+## Runtime
 
 ```bash
-# Build a static x86-64 test binary with musl
-cat > /tmp/hello.c << 'EOF'
-#include <unistd.h>
-int main() {
-    write(1, "hello from atua-computer\n", 25);
-    return 0;
-}
-EOF
-musl-gcc -static -o /workspace/test/fixtures/hello.elf /tmp/hello.c
+wasmer run \
+  --volume /path/to/rootfs:/rootfs \
+  --env BLINK_PREFIX=/rootfs \
+  --env BLINK_WASM_SELF=/rootfs/engine.wasm \
+  engine-wasix.wasm -- /rootfs/bin/bash -c "echo hello"
 ```
 
-## Verify
+- `BLINK_PREFIX`: Prepended to guest absolute paths for host file access
+- `BLINK_WASM_SELF`: Path to engine binary within the volume (needed for fork+exec)
 
-```bash
-# Run the test binary through Blink WASM under Node.js
-node /workspace/wasm/blink.js /workspace/test/fixtures/hello.elf
-# Expected output: hello from atua-computer
-```
+## Current Capabilities
 
-## Current Status
+- Static x86-64 ELF execution
+- Dynamic ELF loading (musl ld.so, libreadline, libncursesw)
+- Alpine bash (musl) — full shell builtins
+- Debian bash (glibc/trixie) — dynamic linking with IRELATIVE relocations
+- Fork+exec via posix_spawn (external commands like `busybox ls`)
+- Fork state serialization (2.7MB state, looped writes for WASI 2MB limit)
+- Pipe fd inheritance via posix_spawn_file_actions
 
-- **Emscripten build:** Working (Phase B stepping stone)
-- **WASIX build:** Future work — requires WASIX-compatible libc and @wasmer/sdk integration
-- **Disabled features:** JIT, threads, fork, metal, sockets (re-enabled in later phases)
-- **Engine size:** ~375KB WASM + ~214KB JS glue
+## Known Gaps
 
-## Architecture Note
-
-The addendum specifies WASIX as the target compilation. Emscripten is used as the
-Phase B stepping stone because Blink already has `__EMSCRIPTEN__` support and it
-provides a proven path to validate x86-64 execution in WASM. The WASIX migration
-is tracked as a Phase C/D task. See `atua-computer-implementation-addendum.md` §2.
-
-// TEMPORARY: Emscripten build. Replace with WASIX (wasi-sdk + wasix-libc) build
-// when WASIX compilation is validated. Tracked in Phase C planning.
+- Fork-restore subshell hangs (child stuck in guest instruction loop, no syscalls reached)
+- Symlinks in rootfs not followed by WASI volume mounts (use real files)
+- Pipe between fork-restored children not yet tested end-to-end
