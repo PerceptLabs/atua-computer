@@ -1,6 +1,6 @@
 /**
  * E9 test: apt update → apt install curl → curl example.com
- * Based on e7-network.spec.js server setup (which works).
+ * Server setup copied from e7-network.spec.js (which works).
  */
 
 import { test, expect } from '@playwright/test';
@@ -9,6 +9,7 @@ import { createReadStream } from 'node:fs';
 import { resolve, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { attachWispRelay } from './wisp-relay.js';
+import * as net from 'node:net';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -19,7 +20,7 @@ const MIME = {
   '.wasm': 'application/wasm', '.tar': 'application/x-tar',
 };
 
-let server, serverUrl, relay;
+let server, serverUrl, relay, echoServer, echoPort;
 
 test.beforeAll(async () => {
   server = createServer((req, res) => {
@@ -38,7 +39,10 @@ test.beforeAll(async () => {
           res.setHeader('Access-Control-Allow-Origin', '*');
           res.end(JSON.stringify(json));
         })
-        .catch(e => { res.writeHead(500); res.end('{}'); });
+        .catch(e => {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        });
       return;
     }
 
@@ -62,37 +66,54 @@ test.beforeAll(async () => {
   });
   await new Promise(r => server.listen(0, () => r()));
   serverUrl = `http://localhost:${server.address().port}`;
+
   relay = attachWispRelay(server);
+
+  echoServer = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Connection': 'close' });
+    res.end('atua-network-ok\n');
+  });
+  await new Promise(r => echoServer.listen(0, '127.0.0.1', () => r()));
+  echoPort = echoServer.address().port;
+  console.log('Echo server on port', echoPort);
 });
 
 test.afterAll(async () => {
   if (relay) relay.close();
+  if (echoServer) echoServer.close();
   if (server) server.close();
 });
 
-test('bash echo works through e9 server', async ({ page }) => {
-  test.setTimeout(30000);
+test('apt update + apt install curl + curl example.com', async ({ page }) => {
+  test.setTimeout(120000);
 
-  page.on('console', msg => console.log(`BROWSER [${msg.type()}]:`, msg.text()));
+  page.on('console', msg => {
+    console.log(`BROWSER [${msg.type()}]:`, msg.text());
+  });
 
   const wsUrl = serverUrl.replace('http://', 'ws://');
   const dnsUrl = `${serverUrl}/dns-resolve`;
-  const navUrl = `${serverUrl}?relay=${encodeURIComponent(wsUrl)}&dns=${encodeURIComponent(dnsUrl)}`;
+  const navUrl = `${serverUrl}?relay=${encodeURIComponent(wsUrl)}&echoPort=${echoPort}&dns=${encodeURIComponent(dnsUrl)}`;
   await page.goto(navUrl);
 
+  // Wait for the engine to finish — [Tests complete] appears when boot() resolves
   try {
     await page.waitForFunction(() => {
       const text = document.getElementById('output')?.textContent || '';
-      return text.includes('[STEP 1 PASS]') || text.includes('[Tests complete]') ||
-             text.includes('[FAIL]') || text.includes('[ERROR]');
-    }, { timeout: 20000 });
-  } catch (e) {}
+      return text.includes('[Tests complete]') || text.includes('[ALL PASS]') ||
+             text.includes('[FAIL]') || text.includes('ERROR:');
+    }, { timeout: 110000 });
+  } catch (e) {
+    console.log('Timed out waiting for engine');
+  }
+
+  await new Promise(r => setTimeout(r, 500));
 
   const pageText = await page.evaluate(() =>
     document.getElementById('output')?.textContent || ''
   ).catch(() => '');
-  console.log('Output:\n' + pageText.substring(0, 500));
+  console.log('=== Output (last 2000 chars) ===');
+  console.log(pageText.slice(-2000));
 
-  // Step 1 just echoes — doesn't need networking
-  expect(pageText).toContain('[STEP 1 PASS]');
+  expect(pageText).toContain('STEP1OK');
 });

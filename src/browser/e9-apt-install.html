@@ -5,8 +5,7 @@
   <title>atua-computer — apt install test</title>
   <style>
     body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
-    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px;
-              min-height: 200px; max-height: 600px; overflow-y: auto; font-size: 12px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
   </style>
 </head>
 <body>
@@ -19,44 +18,32 @@
     const output = document.getElementById('output');
     function log(msg) {
       output.textContent += msg;
-      output.scrollTop = output.scrollHeight;
     }
 
-    // Same URL parsing as e7-network.html (which works)
     const params = new URLSearchParams(location.search);
     const relayUrl = params.get('relay');
     const dnsProxy = params.get('dns');
-
-    const script = [
-      'echo "[STEP 1 PASS] resolv.conf written"',
-      'apt update 2>&1 | tail -5',
-      'if [ $? -eq 0 ]; then echo "[STEP 2 PASS] apt update"; else echo "[FAIL] apt update failed"; exit 1; fi',
-      'apt install -y curl 2>&1 | tail -5',
-      'if [ $? -eq 0 ]; then echo "[STEP 3 PASS] apt install curl"; else echo "[FAIL] apt install curl failed"; exit 1; fi',
-      'curl -s http://example.com 2>&1 | head -5',
-      'if [ $? -eq 0 ]; then echo "[STEP 4 PASS] curl example.com"; else echo "[FAIL] curl failed"; exit 1; fi',
-      'echo "[ALL PASS]"',
-    ].join('; ');
+    const echoPort = params.get('echoPort') || '80';
+    const binary = params.get('bin') || '/bin/bash';
+    const extraArgs = params.get('args') ? params.get('args').split(',') :
+      ['--norc', '--noprofile', '-c', 'echo STEP1OK; echo STEP2OK'];
 
     try {
       const computer = new AtuaComputer();
       log('Booting engine with networking...\n');
       log('Relay: ' + (relayUrl || 'none') + '\n');
+      log('Binary: ' + binary + ' ' + extraArgs.join(' ') + '\n');
 
       await computer.boot({
         engineUrl: '/engine.wasm',
         rootfsUrl: '/debian-mini.tar',
-        args: ['engine', '/bin/bash', '--norc', '--noprofile', '-c', script],
-        env: { HOME: '/', TERM: 'dumb', DEBIAN_FRONTEND: 'noninteractive' },
+        args: ['engine', binary, ...extraArgs],
+        env: { HOME: '/' },
         files: {
-          '/etc/resolv.conf': new TextEncoder().encode('nameserver 8.8.8.8\n'),
-          '/etc/apt/sources.list': new TextEncoder().encode(
-            'deb http://deb.debian.org/debian trixie main\n'
-          ),
+          '/etc/resolv.conf': new TextEncoder().encode('nameserver 1.1.1.1\n'),
         },
-        // Networking disabled for now — focus on bash/apt plumbing first
-        // wispRelayUrl: relayUrl || undefined,
-        // dnsProxyUrl: dnsProxy || undefined,
+        wispRelayUrl: relayUrl || undefined,
+        dnsProxyUrl: dnsProxy || undefined,
         onOutput: (bytes) => {
           log(new TextDecoder().decode(bytes));
         },
@@ -67,7 +54,7 @@
       if (err.message?.includes?.('unreachable')) {
         log('\n[Tests complete]\n');
       } else {
-        log('\n[ERROR] ' + err.message + '\n');
+        log('\nERROR: ' + err.message + '\n');
       }
     }
   </script>

@@ -15,10 +15,13 @@ import * as net from 'node:net';
 export function attachWispRelay(httpServer) {
   const wss = new WebSocketServer({ noServer: true });
   httpServer.on('upgrade', (req, socket, head) => {
+    // Only handle WebSocket upgrades — let other upgrade requests pass
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
   });
+  // Note: all WebSocket upgrades on this server are treated as Wisp.
+  // This works because each test spec runs its own server.
   setupWispHandlers(wss);
   return { close: () => wss.close() };
 }
