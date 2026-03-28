@@ -64,7 +64,7 @@ function childPipeClose(pipeId, end) {
 
 self.onmessage = async (e) => {
   if (e.data.type === 'restore-fork') {
-    const { state, pid, engineUrl, files, pipeSabs } = e.data;
+    const { state, pid, engineUrl, files, symlinks, pipeSabs } = e.data;
 
     // Reconstruct pipe table from parent's SharedArrayBuffers
     if (pipeSabs) {
@@ -81,12 +81,38 @@ self.onmessage = async (e) => {
     // Fetch engine WASM
     const engineBytes = await fetch(engineUrl).then(r => r.arrayBuffer());
 
-    // Build VFS from files (passed as { path: ArrayBuffer })
+    // Build VFS from files + symlinks
     const vfs = new Map();
     if (files) {
       for (const [path, content] of Object.entries(files)) {
         vfs.set(path, new Uint8Array(content));
       }
+    }
+    const symlinkMap = new Map();
+    if (symlinks) {
+      for (const [path, target] of Object.entries(symlinks)) {
+        symlinkMap.set(path, target);
+      }
+    }
+    function normPath(p) {
+      const parts = p.split('/');
+      const r = [];
+      for (const s of parts) { if (s === '' || s === '.') continue; if (s === '..') { r.pop(); continue; } r.push(s); }
+      return '/' + r.join('/');
+    }
+    function resolveSymlinks(path, depth) {
+      if (!symlinkMap.size || (depth || 0) > 10) return path;
+      path = normPath(path);
+      const parts = path.split('/');
+      for (let i = 1; i <= parts.length; i++) {
+        const prefix = parts.slice(0, i).join('/');
+        const target = symlinkMap.get(prefix);
+        if (target) {
+          const rest = parts.slice(i).join('/');
+          return resolveSymlinks(rest ? target + '/' + rest : target, (depth || 0) + 1);
+        }
+      }
+      return path;
     }
     const openFiles = new Map();
     let nextFd = 4;
@@ -115,13 +141,15 @@ self.onmessage = async (e) => {
         },
         fs_open(pathPtr) {
           const mem = new Uint8Array(memory.buffer);
-          let e = pathPtr;
-          while (e < mem.length && mem[e]) e++;
-          const path = new TextDecoder().decode(mem.subarray(pathPtr, e));
-          const content = vfs.get(path) || vfs.get(path.replace(/^\//, ''));
+          let e2 = pathPtr;
+          while (e2 < mem.length && mem[e2]) e2++;
+          let path = new TextDecoder().decode(mem.subarray(pathPtr, e2));
+          if (!path.startsWith('/')) path = '/' + path;
+          path = resolveSymlinks(path);
+          const content = vfs.get(path);
           if (!content) return -1;
           const fd = nextFd++;
-          openFiles.set(fd, { content });
+          openFiles.set(fd, { content, position: 0, path });
           return fd;
         },
         fs_close(fd) {},
@@ -229,19 +257,83 @@ self.onmessage = async (e) => {
               file.position = (file.position || 0) + avail;
               return avail;
             }
-            case 2: { const p = ''; let i = a; while (new Uint8Array(memory.buffer)[i]) { i++; } const path = new TextDecoder().decode(new Uint8Array(memory.buffer, a, i - a)); const content = files[path] || files['/' + path]; if (!content) return -2; const fd = nextFd++; openFiles.set(fd, { content: new Uint8Array(content), position: 0 }); return fd; }
-            case 257: { let i = b; while (new Uint8Array(memory.buffer)[i]) { i++; } const path = new TextDecoder().decode(new Uint8Array(memory.buffer, b, i - b)); const content = files[path] || files['/' + path]; if (!content) return -2; const fd = nextFd++; openFiles.set(fd, { content: new Uint8Array(content), position: 0 }); return fd; }
+            case 2: case 257: {
+              const ptr = n === 2 ? a : b;
+              let i2 = ptr; while (new Uint8Array(memory.buffer)[i2]) i2++;
+              let path = new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, i2 - ptr));
+              if (!path.startsWith('/')) path = '/' + path;
+              path = resolveSymlinks(path);
+              const content = vfs.get(path);
+              if (!content) return -2;
+              const fd = nextFd++;
+              openFiles.set(fd, { content: new Uint8Array(content), position: 0, path });
+              return fd;
+            }
             case 3: openFiles.delete(a); return 0;
             case 5: { const file = openFiles.get(a); new Uint8Array(memory.buffer, b >>> 0, 128).fill(0); const view = new DataView(memory.buffer); view.setUint32(b + 16, 0o100755, true); view.setBigInt64(b + 48, BigInt(file ? file.content.length : 0), true); return file || a <= 2 ? 0 : -9; }
             case 8: { const file = openFiles.get(a); if (!file) return -9; if (c === 0) file.position = b; else if (c === 1) file.position = (file.position||0) + b; else file.position = file.content.length + b; return file.position; }
             case 17: { const file = openFiles.get(a); if (!file) return -9; const dest = new Uint8Array(memory.buffer, b>>>0, c>>>0); const off2 = (d>>>0) + ((e>>>0) * 0x100000000); const av = Math.min(c>>>0, file.content.length - off2); if (av <= 0) return 0; dest.set(file.content.subarray(off2, off2+av)); return av; }
             case 295: { const file = openFiles.get(a); if (!file) return -9; const view = new DataView(memory.buffer); const off2 = (d>>>0); let total = 0; for (let i=0;i<c;i++){const bp=view.getUint32(b+i*8,true),bl=view.getUint32(b+i*8+4,true);const dest=new Uint8Array(memory.buffer,bp,bl);const av=Math.min(bl,file.content.length-off2-total);if(av<=0)break;dest.set(file.content.subarray(off2+total,off2+total+av));total+=av;if(av<bl)break;} return total; }
+            case 19: { // SYS_readv
+              const view = new DataView(memory.buffer);
+              let total = 0;
+              for (let i2 = 0; i2 < c; i2++) {
+                const bp = view.getUint32(b + i2 * 8, true), bl = view.getUint32(b + i2 * 8 + 4, true);
+                const file = openFiles.get(a);
+                if (!file) return total > 0 ? total : (a <= 2 ? 0 : -9);
+                const av = Math.min(bl, file.content.length - (file.position || 0));
+                if (av <= 0) break;
+                new Uint8Array(memory.buffer, bp, av).set(file.content.subarray(file.position || 0, (file.position || 0) + av));
+                file.position = (file.position || 0) + av;
+                total += av;
+                if (av < bl) break;
+              }
+              return total;
+            }
+            case 38: return 0; // SYS_setitimer → no-op
+            case 18: { // SYS_pwrite64
+              const file = openFiles.get(a);
+              if (!file) return -9;
+              const src = new Uint8Array(memory.buffer, b>>>0, c>>>0);
+              const off2 = (d>>>0);
+              if (off2 + c > file.content.length) {
+                const grown = new Uint8Array(off2 + c);
+                grown.set(file.content);
+                file.content = grown;
+              }
+              file.content.set(src, off2);
+              return c;
+            }
+            case 77: return 0; // SYS_ftruncate
             case 72: { if (b===3||b===1||b===2||b===4) return 0; if (b===0||b===1030) return a; return 0; }
             case 79: { new Uint8Array(memory.buffer, a>>>0, 2).set([47, 0]); return a; }
             case 16: return -25; case 51: case 55: return 0; case 95: return 0o22;
-            case 4: case 6: { const path2 = (function(p){const m=new Uint8Array(memory.buffer);let e2=p;while(e2<m.length&&m[e2])e2++;return new TextDecoder().decode(m.subarray(p,e2));})(a); const info2 = (function(path){for(const[k,v]of Object.entries(files)){if(k===path||'/'+k===path||k==='/'+path)return{size:v.byteLength,type:'file'};}return null;})(path2); if(!info2)return-2; new Uint8Array(memory.buffer,b>>>0,128).fill(0); new DataView(memory.buffer).setUint32(b+16,0o100755,true); new DataView(memory.buffer).setBigInt64(b+48,BigInt(info2.size),true); return 0; }
-            case 262: { const path2 = (function(p){const m=new Uint8Array(memory.buffer);let e2=p;while(e2<m.length&&m[e2])e2++;return new TextDecoder().decode(m.subarray(p,e2));})(b); const info2 = (function(path){for(const[k,v]of Object.entries(files)){if(k===path||'/'+k===path||k==='/'+path)return{size:v.byteLength,type:'file'};}return null;})(path2); if(!info2)return-2; new Uint8Array(memory.buffer,c>>>0,128).fill(0); new DataView(memory.buffer).setUint32(c+16,0o100755,true); new DataView(memory.buffer).setBigInt64(c+48,BigInt(info2.size),true); return 0; }
-            case 269: { const path2 = (function(p){const m=new Uint8Array(memory.buffer);let e2=p;while(e2<m.length&&m[e2])e2++;return new TextDecoder().decode(m.subarray(p,e2));})(b); const info2 = (function(path){for(const[k,v]of Object.entries(files)){if(k===path||'/'+k===path||k==='/'+path)return{size:v.byteLength,type:'file'};}return null;})(path2); return info2 ? 0 : -2; }
+            case 4: case 6: {
+              let i3=a;while(new Uint8Array(memory.buffer)[i3])i3++;
+              let p2=new TextDecoder().decode(new Uint8Array(memory.buffer,a,i3-a));
+              if(!p2.startsWith('/'))p2='/'+p2; p2=resolveSymlinks(p2);
+              const f2=vfs.get(p2); if(!f2)return-2;
+              new Uint8Array(memory.buffer,b>>>0,128).fill(0);
+              new DataView(memory.buffer).setUint32(b+16,0o100755,true);
+              new DataView(memory.buffer).setBigInt64(b+48,BigInt(f2.length),true);
+              return 0;
+            }
+            case 262: {
+              let i3=b;while(new Uint8Array(memory.buffer)[i3])i3++;
+              let p2=new TextDecoder().decode(new Uint8Array(memory.buffer,b,i3-b));
+              if(!p2.startsWith('/'))p2='/'+p2; p2=resolveSymlinks(p2);
+              const f2=vfs.get(p2); if(!f2)return-2;
+              new Uint8Array(memory.buffer,c>>>0,128).fill(0);
+              new DataView(memory.buffer).setUint32(c+16,0o100755,true);
+              new DataView(memory.buffer).setBigInt64(c+48,BigInt(f2.length),true);
+              return 0;
+            }
+            case 269: {
+              let i3=b;while(new Uint8Array(memory.buffer)[i3])i3++;
+              let p2=new TextDecoder().decode(new Uint8Array(memory.buffer,b,i3-b));
+              if(!p2.startsWith('/'))p2='/'+p2; p2=resolveSymlinks(p2);
+              return vfs.has(p2)?0:-2;
+            }
             case 332: return -38; case 121: return 0;
             case 24: case 97: case 127: case 160: return 0;
             case 63: { const buf2 = new Uint8Array(memory.buffer, a>>>0, 325); buf2.fill(0); const fields = ["Linux","atua","6.1.0","#1","x86_64"]; for (let i=0;i<5;i++){const b2=new TextEncoder().encode(fields[i]);buf2.set(b2,i*65);} return 0; }
@@ -264,7 +356,9 @@ self.onmessage = async (e) => {
             case 118: case 120: { if(a)new DataView(memory.buffer).setUint32(a>>>0,0,true);if(b)new DataView(memory.buffer).setUint32(b>>>0,0,true);if(c)new DataView(memory.buffer).setUint32(c>>>0,0,true);return 0; }
             case 15: case 157: case 158: case 160: case 161: case 162: return 0;
             case 60: case 231: case 62: case 200: case 234: throw new WebAssembly.RuntimeError('unreachable');
-            default: return -38;
+            default:
+              self.postMessage({ type: 'stdout', data: new TextEncoder().encode('CHILD-ENOSYS:' + n + '\n') });
+              return -38;
           }
         },
         args_sizes_get(ac, bs) {

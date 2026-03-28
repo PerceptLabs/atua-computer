@@ -134,7 +134,7 @@ export class AtuaComputer {
   }
 
   _spawnChildWorker(msg) {
-    const { state, pid, files, waitFlag, pipeSabs } = msg;
+    const { state, pid, files, symlinks, waitFlag, pipeSabs } = msg;
 
     const child = new Worker('/engine-worker.js');
     this._children.set(pid, child);
@@ -167,6 +167,7 @@ export class AtuaComputer {
       pid,
       engineUrl: '/engine.wasm',
       files,
+      symlinks: symlinks || {},
       pipeSabs: pipeSabs || {},
     });
   }

@@ -1251,10 +1251,16 @@ function createImports(args, env, getCwd, setCwd) {
       const state = new Uint8Array(memory.buffer, statePtr, stateLen).slice();
       const pid = nextPid++;
 
-      // Serialize VFS files for the child
+      // Serialize VFS files and symlinks for the child
       const files = {};
       for (const [path, content] of vfs.files) {
         files[path] = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
+      }
+      const symlinks = {};
+      if (vfs.symlinks) {
+        for (const [path, target] of vfs.symlinks) {
+          symlinks[path] = target;
+        }
       }
 
       // Create a SharedArrayBuffer flag for wait synchronization
@@ -1273,6 +1279,7 @@ function createImports(args, env, getCwd, setCwd) {
         state: state.buffer,
         pid,
         files,
+        symlinks,
         waitFlag,
         pipeSabs,
       }, [state.buffer]);

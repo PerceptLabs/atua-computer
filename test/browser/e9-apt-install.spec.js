@@ -85,7 +85,7 @@ test.afterAll(async () => {
 });
 
 test('apt update + apt install curl + curl example.com', async ({ page }) => {
-  test.setTimeout(120000);
+  test.setTimeout(300000);  // 5 minutes — apt is slow through interpreter
 
   page.on('console', msg => {
     console.log(`BROWSER [${msg.type()}]:`, msg.text());
@@ -102,7 +102,7 @@ test('apt update + apt install curl + curl example.com', async ({ page }) => {
       const text = document.getElementById('output')?.textContent || '';
       return text.includes('[Tests complete]') || text.includes('[ALL PASS]') ||
              text.includes('[FAIL]') || text.includes('ERROR:');
-    }, { timeout: 110000 });
+    }, { timeout: 280000 });
   } catch (e) {
     console.log('Timed out waiting for engine');
   }
