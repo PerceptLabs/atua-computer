@@ -194,9 +194,8 @@ async function bootEngine(opts) {
 
 function createImports(args, env, getCwd, setCwd) {
   // Host syscall state (closure variables, not `this`)
-  // brk and mmap use SEPARATE regions to prevent musl's allocator from
-  // confusing brk-allocated chunks with mmap-allocated ones.
   const hostState = { brk: 0 };
+  const mmapFreelist = []; // {ptr, size} — reusable mmap regions
 
   function readCString(ptr) {
     const mem = new Uint8Array(memory.buffer);
@@ -372,13 +371,23 @@ function createImports(args, env, getCwd, setCwd) {
           const len = b >>> 0;
           const flags = d;
           const MAP_ANONYMOUS = 0x20;
-          // Allocate from top of linear memory via memory.grow.
-          // Page-align the allocation (WASM pages are 64KB).
-          const pages = Math.ceil(len / 65536);
-          const oldPages = memory.buffer.byteLength / 65536;
-          try { memory.grow(pages); } catch { return -12; /* ENOMEM */ }
-          const ptr = oldPages * 65536;
-          new Uint8Array(memory.buffer, ptr, len).fill(0);
+          let ptr;
+          // Try freelist first (first-fit)
+          for (let i = 0; i < mmapFreelist.length; i++) {
+            if (mmapFreelist[i].size >= len) {
+              ptr = mmapFreelist.splice(i, 1)[0].ptr;
+              new Uint8Array(memory.buffer, ptr, len).fill(0);
+              break;
+            }
+          }
+          if (ptr === undefined) {
+            // Freelist miss — grow memory
+            const pages = Math.ceil(len / 65536);
+            const oldPages = memory.buffer.byteLength / 65536;
+            try { memory.grow(pages); } catch { return -12; /* ENOMEM */ }
+            ptr = oldPages * 65536;
+            new Uint8Array(memory.buffer, ptr, len).fill(0);
+          }
           if (!(flags & MAP_ANONYMOUS)) {
             const file = vfs.openFiles.get(e);
             if (file) {
@@ -390,7 +399,12 @@ function createImports(args, env, getCwd, setCwd) {
           return ptr;
         }
         case 10: return 0;  // SYS_mprotect — no-op
-        case 11: return 0;  // SYS_munmap — no-op (WASM can't free pages)
+        case 11: { // SYS_munmap — return pages to freelist
+          const ptr = a >>> 0;
+          const len = b >>> 0;
+          if (ptr && len) mmapFreelist.push({ ptr, size: len });
+          return 0;
+        }
 
         /* I/O */
         case 0: { // SYS_read(fd, buf, count)
@@ -655,15 +669,173 @@ function createImports(args, env, getCwd, setCwd) {
         case 234: // SYS_tgkill
           throw new WebAssembly.RuntimeError('unreachable');
 
-        /* Everything else */
+        /* I/O: dup, pipe, directory, link, truncate */
+        case 32: return a;    // SYS_dup → return same fd
+        case 33: return b;    // SYS_dup2 → return newfd
+        case 292: return b;   // SYS_dup3 → return newfd
+        case 22: return -38;  // SYS_pipe → ENOSYS (Blink handles guest pipes)
+        case 293: return -38; // SYS_pipe2 → ENOSYS (Blink handles guest pipes)
+        case 18: { // SYS_pwrite64(fd, buf, count, offset_lo, offset_hi)
+          const file = vfs.openFiles.get(a);
+          if (!file) return -9; // EBADF
+          const src = new Uint8Array(memory.buffer, b >>> 0, c >>> 0);
+          const offset = (d >>> 0) + ((e >>> 0) * 0x100000000);
+          vfs.write(a, src, offset);
+          return c;
+        }
+        case 77: { // SYS_ftruncate(fd, length)
+          const file = vfs.openFiles.get(a);
+          if (!file) return -9;
+          const newLen = b >>> 0;
+          const old = file.content;
+          if (newLen < old.length) {
+            file.content = old.subarray(0, newLen);
+          } else if (newLen > old.length) {
+            const expanded = new Uint8Array(newLen);
+            expanded.set(old);
+            file.content = expanded;
+          }
+          vfs.files.set(file.path, file.content);
+          return 0;
+        }
+        case 83: case 258: { // SYS_mkdir / SYS_mkdirat
+          const path = readCString(n === 83 ? a : b);
+          vfs.dirs.add(path.startsWith('/') ? path : '/' + path);
+          return 0;
+        }
+        case 87: case 263: { // SYS_unlink / SYS_unlinkat
+          const path = readCString(n === 87 ? a : b);
+          const norm = path.startsWith('/') ? path : '/' + path;
+          vfs.files.delete(norm);
+          return 0;
+        }
+        case 82: case 264: case 316: { // SYS_rename / SYS_renameat / SYS_renameat2
+          const oldPath = readCString(n === 82 ? a : b);
+          const newPath = readCString(n === 82 ? b : (n === 264 ? d : d));
+          const normOld = oldPath.startsWith('/') ? oldPath : '/' + oldPath;
+          const normNew = newPath.startsWith('/') ? newPath : '/' + newPath;
+          const content = vfs.files.get(normOld);
+          if (!content) return -2;
+          vfs.files.set(normNew, content);
+          vfs.files.delete(normOld);
+          return 0;
+        }
+        case 89: case 267: return -2; // SYS_readlink(at) → ENOENT (no symlinks)
+        case 217: { // SYS_getdents64(fd, dirp, count)
+          // Minimal: return 0 (end of directory) — VFS doesn't track dir handles
+          return 0;
+        }
+
+        /* Process/signal (single-process defaults) */
         case 21: return -2;   // SYS_access → ENOENT
         case 24: return 0;    // SYS_sched_yield
-        case 56: return -38;  // SYS_clone → ENOSYS
-        case 57: return -38;  // SYS_fork → ENOSYS (handled by Blink's SysFork)
+        case 25: return -38;  // SYS_mremap → ENOSYS
+        case 28: return 0;    // SYS_madvise → no-op
+        case 56: return -38;  // SYS_clone → ENOSYS (Blink handles)
+        case 57: return -38;  // SYS_fork → ENOSYS (Blink handles)
+        case 59: return -38;  // SYS_execve → ENOSYS (Blink handles)
+        case 61: return -10;  // SYS_wait4 → ECHILD (no HOST children)
         case 95: return 0o22; // SYS_umask → return old mask
+        case 96: { // SYS_gettimeofday(tv, tz)
+          if (a) {
+            const now = Date.now();
+            const view = new DataView(memory.buffer);
+            view.setBigInt64(a >>> 0, BigInt(Math.floor(now / 1000)), true);       // tv_sec
+            view.setBigInt64((a >>> 0) + 8, BigInt((now % 1000) * 1000), true);    // tv_usec
+          }
+          return 0;
+        }
         case 97: return 0;    // SYS_getrlimit
+        case 98: { // SYS_getrusage
+          new Uint8Array(memory.buffer, b >>> 0, 144).fill(0);
+          return 0;
+        }
+        case 100: { // SYS_times(buf)
+          if (a) new Uint8Array(memory.buffer, a >>> 0, 32).fill(0);
+          return 0;
+        }
+        case 105: return 0;   // SYS_setuid
+        case 106: return 0;   // SYS_setgid
+        case 109: return 0;   // SYS_setpgid
+        case 111: return 0;   // SYS_getpgrp
+        case 112: return 1;   // SYS_setsid
+        case 113: return 0;   // SYS_setreuid
+        case 114: return 0;   // SYS_setregid
+        case 117: return 0;   // SYS_setresuid
+        case 118: { // SYS_getresuid(ruid, euid, suid)
+          if (a) new DataView(memory.buffer).setUint32(a >>> 0, 0, true);
+          if (b) new DataView(memory.buffer).setUint32(b >>> 0, 0, true);
+          if (c) new DataView(memory.buffer).setUint32(c >>> 0, 0, true);
+          return 0;
+        }
+        case 119: return 0;   // SYS_setresgid
+        case 120: { // SYS_getresgid(rgid, egid, sgid)
+          if (a) new DataView(memory.buffer).setUint32(a >>> 0, 0, true);
+          if (b) new DataView(memory.buffer).setUint32(b >>> 0, 0, true);
+          if (c) new DataView(memory.buffer).setUint32(c >>> 0, 0, true);
+          return 0;
+        }
+        case 124: return 0;   // SYS_getsid
+        case 15: return 0;    // SYS_rt_sigreturn
+        case 157: return 0;   // SYS_prctl
+        case 158: return 0;   // SYS_arch_prctl
         case 160: return 0;   // SYS_setrlimit
-        default: return -38;  // ENOSYS
+        case 247: return -38; // SYS_waitid → ENOSYS
+
+        /* Filesystem metadata stubs */
+        case 90: return 0;    // SYS_chmod
+        case 91: return 0;    // SYS_fchmod
+        case 92: return 0;    // SYS_chown
+        case 93: return 0;    // SYS_fchown
+        case 94: return 0;    // SYS_lchown
+        case 132: return 0;   // SYS_utime
+        case 280: return 0;   // SYS_utimensat
+        case 133: return -38; // SYS_mknod → ENOSYS
+        case 137: return 0;   // SYS_statfs → return ENOSYS? Let's try 0
+        case 138: return 0;   // SYS_fstatfs
+        case 191: return 0;   // SYS_getxattr → return 0 (no attrs)
+        case 192: return 0;   // SYS_lgetxattr
+        case 193: return 0;   // SYS_fgetxattr
+        case 197: return -38; // SYS_removexattr
+        case 198: return -38; // SYS_lremovexattr
+        case 199: return -38; // SYS_fremovexattr
+        case 74: return 0;    // SYS_fsync
+        case 75: return 0;    // SYS_fdatasync
+        case 76: return 0;    // SYS_truncate
+        case 80: return 0;    // SYS_chdir (HOST) — Blink handles guest chdir
+        case 161: return 0;   // SYS_chroot → no-op
+        case 162: return 0;   // SYS_sync
+
+        /* Network stubs (HOST doesn't use sockets — guest sockets go through Blink) */
+        case 41: return -97;  // SYS_socket → EAFNOSUPPORT (HOST shouldn't create sockets)
+        case 42: return -38;  // SYS_connect
+        case 43: return -38;  // SYS_accept
+        case 44: return -38;  // SYS_sendto
+        case 45: return -38;  // SYS_recvfrom
+        case 46: return -38;  // SYS_sendmsg
+        case 47: return -38;  // SYS_recvmsg
+        case 48: return -38;  // SYS_shutdown
+        case 49: return -38;  // SYS_bind
+        case 50: return -38;  // SYS_listen
+        case 51: return 0;    // SYS_getsockname → success (musl probes this)
+        case 52: return 0;    // SYS_getpeername
+        case 53: return -38;  // SYS_socketpair
+        case 54: return 0;    // SYS_setsockopt
+        case 55: return 0;    // SYS_getsockopt
+        case 7: return 0;     // SYS_poll → 0 events ready
+        case 23: return 0;    // SYS_select → 0 ready
+
+        /* Impossible in browser */
+        case 101: return -38; // SYS_ptrace
+        case 165: return -38; // SYS_mount
+        case 166: return -38; // SYS_umount2
+        case 169: return -38; // SYS_reboot
+
+        default: {
+          const NAMES = {0:'read',1:'write',2:'open',3:'close',4:'stat',5:'fstat',6:'lstat',7:'poll',8:'lseek',9:'mmap',10:'mprotect',11:'munmap',12:'brk',13:'rt_sigaction',14:'rt_sigprocmask',15:'rt_sigreturn',16:'ioctl',17:'pread64',18:'pwrite64',19:'readv',20:'writev',21:'access',22:'pipe',23:'select',24:'sched_yield',25:'mremap',28:'madvise',32:'dup',33:'dup2',35:'nanosleep',39:'getpid',41:'socket',42:'connect',43:'accept',44:'sendto',45:'recvfrom',46:'sendmsg',47:'recvmsg',48:'shutdown',49:'bind',50:'listen',51:'getsockname',52:'getpeername',53:'socketpair',54:'setsockopt',55:'getsockopt',56:'clone',57:'fork',59:'execve',60:'exit',61:'wait4',62:'kill',63:'uname',72:'fcntl',77:'ftruncate',78:'getdents',79:'getcwd',80:'chdir',82:'rename',83:'mkdir',87:'unlink',89:'readlink',90:'chmod',95:'umask',96:'gettimeofday',97:'getrlimit',98:'getrusage',100:'times',102:'getuid',104:'getgid',105:'setuid',106:'setgid',107:'geteuid',108:'getegid',109:'setpgid',110:'getppid',112:'setsid',113:'setreuid',114:'setregid',117:'setresuid',118:'getresuid',119:'setresgid',120:'getresgid',121:'getpgid',124:'getsid',131:'sigaltstack',157:'prctl',158:'arch_prctl',160:'setrlimit',186:'gettid',200:'tkill',205:'set_thread_area',217:'getdents64',218:'set_tid_address',228:'clock_gettime',229:'clock_getres',231:'exit_group',234:'tgkill',257:'openat',262:'newfstatat',263:'unlinkat',267:'readlinkat',269:'faccessat',273:'set_robust_list',293:'pipe2',295:'preadv',302:'prlimit64',316:'renameat2',318:'getrandom',332:'statx'};
+          console.warn('[host_syscall] unhandled:', n, NAMES[n] || 'unknown');
+          return -38; // ENOSYS
+        }
       }
     },
 

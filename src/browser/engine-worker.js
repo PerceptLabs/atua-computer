@@ -91,6 +91,7 @@ self.onmessage = async (e) => {
     const openFiles = new Map();
     let nextFd = 4;
     let childBrk = 0;
+    const childMmapFree = [];
     let childMmapTop = 0;
 
     // Create imports — similar to parent but stdout goes to postMessage
@@ -182,20 +183,27 @@ self.onmessage = async (e) => {
               childBrk = t;
               return t;
             }
-            case 9: { // mmap — use memory.grow for each allocation
+            case 9: { // mmap with freelist
               const len = b >>> 0;
-              const pages = Math.ceil(len / 65536);
-              const oldPages = memory.buffer.byteLength / 65536;
-              try { memory.grow(pages); } catch { return -12; }
-              const ptr = oldPages * 65536;
-              new Uint8Array(memory.buffer, ptr, len).fill(0);
+              let ptr;
+              for (let i = 0; i < childMmapFree.length; i++) {
+                if (childMmapFree[i].size >= len) { ptr = childMmapFree.splice(i, 1)[0].ptr; new Uint8Array(memory.buffer, ptr, len).fill(0); break; }
+              }
+              if (ptr === undefined) {
+                const pages = Math.ceil(len / 65536);
+                const oldPages = memory.buffer.byteLength / 65536;
+                try { memory.grow(pages); } catch { return -12; }
+                ptr = oldPages * 65536;
+                new Uint8Array(memory.buffer, ptr, len).fill(0);
+              }
               if (!(d & 0x20)) {
                 const file = openFiles.get(e);
                 if (file) { const off = Number(f) || 0; const av = Math.min(len, file.content.length - off); if (av > 0) new Uint8Array(memory.buffer, ptr, av).set(file.content.subarray(off, off + av)); }
               }
               return ptr;
             }
-            case 10: return 0; case 11: return 0; // mprotect, munmap
+            case 10: return 0; // mprotect
+            case 11: { const p = a >>> 0; const l = b >>> 0; if (p && l) childMmapFree.push({ptr: p, size: l}); return 0; } // munmap
             case 1: { // write
               const buf = new Uint8Array(memory.buffer, b >>> 0, c >>> 0);
               if (a === 1 || a === 2) { self.postMessage({ type: 'stdout', data: new Uint8Array(buf) }); return c; }
@@ -245,6 +253,17 @@ self.onmessage = async (e) => {
             case 186: return 1; case 205: return 0; case 218: return 1; case 273: return 0;
             case 13: return 0; case 14: return 0; case 131: return 0;
             case 60: case 231: throw new WebAssembly.RuntimeError('unreachable');
+            /* Process/signal defaults */
+            case 21: return -2; case 24: return 0; case 25: return -38; case 28: return 0;
+            case 32: return a; case 33: return b; case 41: return -97; case 51: case 52: case 54: case 55: return 0;
+            case 56: case 57: case 59: return -38; case 61: return -10;
+            case 74: case 75: case 76: case 80: case 90: case 91: case 92: case 93: case 94: return 0;
+            case 95: return 0o22; case 96: { if(a){const now=Date.now();const v=new DataView(memory.buffer);v.setBigInt64(a>>>0,BigInt(Math.floor(now/1000)),true);v.setBigInt64((a>>>0)+8,BigInt((now%1000)*1000),true);}return 0; }
+            case 97: case 98: case 100: return 0; case 105: case 106: case 109: case 111: return 0;
+            case 112: return 1; case 113: case 114: case 117: case 119: case 124: return 0;
+            case 118: case 120: { if(a)new DataView(memory.buffer).setUint32(a>>>0,0,true);if(b)new DataView(memory.buffer).setUint32(b>>>0,0,true);if(c)new DataView(memory.buffer).setUint32(c>>>0,0,true);return 0; }
+            case 15: case 157: case 158: case 160: case 161: case 162: return 0;
+            case 60: case 231: case 62: case 200: case 234: throw new WebAssembly.RuntimeError('unreachable');
             default: return -38;
           }
         },

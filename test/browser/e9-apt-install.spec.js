@@ -54,7 +54,7 @@ test.beforeAll(async () => {
       '/filesystem.js': join(BROWSER_DIR, 'filesystem.js'),
       '/engine-worker.js': join(BROWSER_DIR, 'engine-worker.js'),
       '/engine-main-worker.js': join(BROWSER_DIR, 'engine-main-worker.js'),
-      '/debian-mini.tar': join(ROOT, 'test/fixtures/debian-mini.tar'),
+      '/debian-rootfs.tar': join(ROOT, 'wasm/debian-rootfs.tar'),
     };
 
     const filePath = map[url.pathname] || join(BROWSER_DIR, url.pathname);
@@ -115,5 +115,5 @@ test('apt update + apt install curl + curl example.com', async ({ page }) => {
   console.log('=== Output (last 2000 chars) ===');
   console.log(pageText.slice(-2000));
 
-  expect(pageText).toContain('[STEP 1 PASS]');
+  expect(pageText).toContain('ROOTFS-OK');
 });
