@@ -90,6 +90,8 @@ self.onmessage = async (e) => {
     }
     const openFiles = new Map();
     let nextFd = 4;
+    let childBrk = 0;
+    let childMmapTop = 0;
 
     // Create imports — similar to parent but stdout goes to postMessage
     const result = await WebAssembly.instantiate(engineBytes, {
@@ -156,6 +158,96 @@ self.onmessage = async (e) => {
         socket_recv() { return -1; },
         socket_close() {},
         socket_poll() { return 0; },
+        sleep_ms(ms) {
+          if (!self._sleepSab) self._sleepSab = new Int32Array(new SharedArrayBuffer(4));
+          Atomics.wait(self._sleepSab, 0, 0, ms > 0 ? ms : 1);
+        },
+        random_get(bufPtr, len) {
+          const buf = new Uint8Array(memory.buffer, bufPtr, len);
+          crypto.getRandomValues(buf);
+        },
+        term_get_size(rowsPtr, colsPtr) {
+          const view = new DataView(memory.buffer);
+          view.setInt32(rowsPtr, 24, true);
+          view.setInt32(colsPtr, 80, true);
+        },
+        /* host_syscall for child worker — musl libc syscall dispatch */
+        host_syscall(n, a, b, c, d, e, f) {
+          switch (n) {
+            case 12: { // brk
+              if (!childBrk) childBrk = memory.buffer.byteLength;
+              if (a === 0) return childBrk;
+              const t = a >>> 0, cp = memory.buffer.byteLength / 65536, np = Math.ceil(t / 65536);
+              if (np > cp) { try { memory.grow(np - cp); } catch { return childBrk; } }
+              childBrk = t;
+              return t;
+            }
+            case 9: { // mmap — use memory.grow for each allocation
+              const len = b >>> 0;
+              const pages = Math.ceil(len / 65536);
+              const oldPages = memory.buffer.byteLength / 65536;
+              try { memory.grow(pages); } catch { return -12; }
+              const ptr = oldPages * 65536;
+              new Uint8Array(memory.buffer, ptr, len).fill(0);
+              if (!(d & 0x20)) {
+                const file = openFiles.get(e);
+                if (file) { const off = Number(f) || 0; const av = Math.min(len, file.content.length - off); if (av > 0) new Uint8Array(memory.buffer, ptr, av).set(file.content.subarray(off, off + av)); }
+              }
+              return ptr;
+            }
+            case 10: return 0; case 11: return 0; // mprotect, munmap
+            case 1: { // write
+              const buf = new Uint8Array(memory.buffer, b >>> 0, c >>> 0);
+              if (a === 1 || a === 2) { self.postMessage({ type: 'stdout', data: new Uint8Array(buf) }); return c; }
+              return c;
+            }
+            case 20: { // writev
+              const view = new DataView(memory.buffer);
+              let total = 0;
+              for (let i = 0; i < c; i++) {
+                const bp = view.getUint32(b + i * 8, true), bl = view.getUint32(b + i * 8 + 4, true);
+                if (a === 1 || a === 2) self.postMessage({ type: 'stdout', data: new Uint8Array(memory.buffer, bp, bl) });
+                total += bl;
+              }
+              return total;
+            }
+            case 0: { // read
+              const file = openFiles.get(a);
+              if (!file) return a <= 2 ? 0 : -9;
+              const dest = new Uint8Array(memory.buffer, b >>> 0, c >>> 0);
+              const avail = Math.min(c, file.content.length - (file.position || 0));
+              if (avail <= 0) return 0;
+              dest.set(file.content.subarray(file.position || 0, (file.position || 0) + avail));
+              file.position = (file.position || 0) + avail;
+              return avail;
+            }
+            case 2: { const p = ''; let i = a; while (new Uint8Array(memory.buffer)[i]) { i++; } const path = new TextDecoder().decode(new Uint8Array(memory.buffer, a, i - a)); const content = files[path] || files['/' + path]; if (!content) return -2; const fd = nextFd++; openFiles.set(fd, { content: new Uint8Array(content), position: 0 }); return fd; }
+            case 257: { let i = b; while (new Uint8Array(memory.buffer)[i]) { i++; } const path = new TextDecoder().decode(new Uint8Array(memory.buffer, b, i - b)); const content = files[path] || files['/' + path]; if (!content) return -2; const fd = nextFd++; openFiles.set(fd, { content: new Uint8Array(content), position: 0 }); return fd; }
+            case 3: openFiles.delete(a); return 0;
+            case 5: { const file = openFiles.get(a); new Uint8Array(memory.buffer, b >>> 0, 128).fill(0); const view = new DataView(memory.buffer); view.setUint32(b + 16, 0o100755, true); view.setBigInt64(b + 48, BigInt(file ? file.content.length : 0), true); return file || a <= 2 ? 0 : -9; }
+            case 8: { const file = openFiles.get(a); if (!file) return -9; if (c === 0) file.position = b; else if (c === 1) file.position = (file.position||0) + b; else file.position = file.content.length + b; return file.position; }
+            case 17: { const file = openFiles.get(a); if (!file) return -9; const dest = new Uint8Array(memory.buffer, b>>>0, c>>>0); const off2 = (d>>>0) + ((e>>>0) * 0x100000000); const av = Math.min(c>>>0, file.content.length - off2); if (av <= 0) return 0; dest.set(file.content.subarray(off2, off2+av)); return av; }
+            case 295: { const file = openFiles.get(a); if (!file) return -9; const view = new DataView(memory.buffer); const off2 = (d>>>0); let total = 0; for (let i=0;i<c;i++){const bp=view.getUint32(b+i*8,true),bl=view.getUint32(b+i*8+4,true);const dest=new Uint8Array(memory.buffer,bp,bl);const av=Math.min(bl,file.content.length-off2-total);if(av<=0)break;dest.set(file.content.subarray(off2+total,off2+total+av));total+=av;if(av<bl)break;} return total; }
+            case 72: { if (b===3||b===1||b===2||b===4) return 0; if (b===0||b===1030) return a; return 0; }
+            case 79: { new Uint8Array(memory.buffer, a>>>0, 2).set([47, 0]); return a; }
+            case 16: return -25; case 51: case 55: return 0; case 95: return 0o22;
+            case 4: case 6: { const path2 = (function(p){const m=new Uint8Array(memory.buffer);let e2=p;while(e2<m.length&&m[e2])e2++;return new TextDecoder().decode(m.subarray(p,e2));})(a); const info2 = (function(path){for(const[k,v]of Object.entries(files)){if(k===path||'/'+k===path||k==='/'+path)return{size:v.byteLength,type:'file'};}return null;})(path2); if(!info2)return-2; new Uint8Array(memory.buffer,b>>>0,128).fill(0); new DataView(memory.buffer).setUint32(b+16,0o100755,true); new DataView(memory.buffer).setBigInt64(b+48,BigInt(info2.size),true); return 0; }
+            case 262: { const path2 = (function(p){const m=new Uint8Array(memory.buffer);let e2=p;while(e2<m.length&&m[e2])e2++;return new TextDecoder().decode(m.subarray(p,e2));})(b); const info2 = (function(path){for(const[k,v]of Object.entries(files)){if(k===path||'/'+k===path||k==='/'+path)return{size:v.byteLength,type:'file'};}return null;})(path2); if(!info2)return-2; new Uint8Array(memory.buffer,c>>>0,128).fill(0); new DataView(memory.buffer).setUint32(c+16,0o100755,true); new DataView(memory.buffer).setBigInt64(c+48,BigInt(info2.size),true); return 0; }
+            case 269: { const path2 = (function(p){const m=new Uint8Array(memory.buffer);let e2=p;while(e2<m.length&&m[e2])e2++;return new TextDecoder().decode(m.subarray(p,e2));})(b); const info2 = (function(path){for(const[k,v]of Object.entries(files)){if(k===path||'/'+k===path||k==='/'+path)return{size:v.byteLength,type:'file'};}return null;})(path2); return info2 ? 0 : -2; }
+            case 332: return -38; case 121: return 0;
+            case 24: case 97: case 127: case 160: return 0;
+            case 63: { const buf2 = new Uint8Array(memory.buffer, a>>>0, 325); buf2.fill(0); const fields = ["Linux","atua","6.1.0","#1","x86_64"]; for (let i=0;i<5;i++){const b2=new TextEncoder().encode(fields[i]);buf2.set(b2,i*65);} return 0; }
+            case 302: { if (d) { const view = new DataView(memory.buffer); view.setBigUint64(d>>>0, 1024n, true); view.setBigUint64((d>>>0)+8, 1024n, true); } return 0; }
+            case 228: { const view = new DataView(memory.buffer); const ns = BigInt(Math.floor(Date.now() * 1e6)); view.setBigInt64(b >>> 0, ns / 1000000000n, true); view.setBigInt64((b >>> 0) + 8, ns % 1000000000n, true); return 0; }
+            case 318: { crypto.getRandomValues(new Uint8Array(memory.buffer, a >>> 0, b >>> 0)); return b; }
+            case 35: { const view = new DataView(memory.buffer); const sec = Number(view.getBigInt64(a >>> 0, true)); const nsec = Number(view.getBigInt64((a >>> 0) + 8, true)); const ms = sec * 1000 + Math.floor(nsec / 1e6); if (ms > 0) { if (!self._sleepSab) self._sleepSab = new Int32Array(new SharedArrayBuffer(4)); Atomics.wait(self._sleepSab, 0, 0, ms); } return 0; }
+            case 39: return 1; case 110: return 0; case 102: return 0; case 104: return 0; case 107: return 0; case 108: return 0;
+            case 186: return 1; case 205: return 0; case 218: return 1; case 273: return 0;
+            case 13: return 0; case 14: return 0; case 131: return 0;
+            case 60: case 231: throw new WebAssembly.RuntimeError('unreachable');
+            default: return -38;
+          }
+        },
         args_sizes_get(ac, bs) {
           const view = new DataView(memory.buffer);
           view.setUint32(ac, 0, true);
@@ -177,19 +269,19 @@ self.onmessage = async (e) => {
     memory = instance.exports.memory;
 
     // Write fork state into WASM memory
+    self.postMessage({ type: 'stdout', data: new TextEncoder().encode('CHILD: malloc state ' + state.byteLength + '\n') });
     const stateBytes = new Uint8Array(state);
     const statePtr = instance.exports.malloc(stateBytes.length);
+    self.postMessage({ type: 'stdout', data: new TextEncoder().encode('CHILD: malloc returned ' + statePtr + '\n') });
     new Uint8Array(memory.buffer, statePtr, stateBytes.length).set(stateBytes);
 
     // Call restore_fork
+    self.postMessage({ type: 'stdout', data: new TextEncoder().encode('CHILD: calling restore_fork\n') });
     try {
       instance.exports.restore_fork(statePtr, stateBytes.length);
+      self.postMessage({ type: 'stdout', data: new TextEncoder().encode('CHILD: restore_fork returned\n') });
     } catch (err) {
-      if (err instanceof WebAssembly.RuntimeError && err.message.includes('unreachable')) {
-        // Normal exit
-      } else {
-        self.postMessage({ type: 'error', message: err.message });
-      }
+      self.postMessage({ type: 'stdout', data: new TextEncoder().encode('CHILD: ' + err.message + ' at ' + (err.stack || '').split('\n').slice(0, 3).join(' | ') + '\n') });
     }
 
     // Read exit code from exported function (set by __wasi_proc_exit before trap)

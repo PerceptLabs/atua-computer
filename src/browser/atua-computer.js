@@ -67,12 +67,23 @@ export class AtuaComputer {
       this._worker.onmessage = (e) => this._handleWorkerMessage(e, resolve);
       this._worker.onerror = (e) => reject(new Error('Worker error: ' + e.message));
 
+      // Build args — inject strace/statistics flags if requested
+      let args = opts.args || ['engine'];
+      if (opts.syscallTrace) {
+        const level = typeof opts.syscallTrace === 'number' ? opts.syscallTrace : 1;
+        const sFlag = '-' + 's'.repeat(Math.min(level, 4));
+        args = [args[0], sFlag, ...args.slice(1)];
+      }
+      if (opts.statistics) {
+        args = [args[0], '-Z', ...args.slice(1)];
+      }
+
       // Boot the engine on the Worker
       this._worker.postMessage({
         type: 'boot',
         engineWasm: this._engineWasm,
         rootfsTar,
-        args: opts.args || ['engine'],
+        args,
         env: opts.env || {},
         files,
         stdinSab: this._stdinSab,
@@ -140,6 +151,10 @@ export class AtuaComputer {
         }
         this._children.delete(pid);
       }
+    };
+
+    child.onerror = (err) => {
+      console.error('Child Worker error:', err.message);
     };
 
     child.postMessage({
@@ -223,11 +238,19 @@ export class AtuaComputer {
 
     const queryBuf = new Uint8Array(data);
 
-    // Parse hostname from DNS wire format query
-    const hostname = this._parseDnsQueryName(queryBuf);
-    if (!hostname) {
+    // Parse hostname and QTYPE from DNS wire format query
+    const parsed = this._parseDnsQuery(queryBuf);
+    if (!parsed) {
       Atomics.store(entry.control, 2, 1); // signal closed/error
       Atomics.notify(entry.control, 1);
+      return;
+    }
+    const { hostname, qtype } = parsed;
+
+    // Only resolve A records (type 1). For AAAA (28) and others, return NODATA.
+    if (qtype !== 1) {
+      const response = this._buildDnsResponse(queryBuf, null, false); // NODATA, not NXDOMAIN
+      this._writeToSocketSab(entry, response);
       return;
     }
 
@@ -235,7 +258,6 @@ export class AtuaComputer {
       // Resolve via DoH — fetch on MAIN THREAD (Worker is blocked on Atomics.wait)
       let ip = null;
       if (this._dnsProxyUrl) {
-        // Use local proxy to avoid CORS
         const resp = await fetch(`${this._dnsProxyUrl}?name=${hostname}&type=A`);
         const json = await resp.json();
         ip = json.Answer?.[0]?.data || json.ip || null;
@@ -246,13 +268,11 @@ export class AtuaComputer {
       }
 
       if (!ip) {
-        // NXDOMAIN — build error response
-        const response = this._buildDnsResponse(queryBuf, null);
+        const response = this._buildDnsResponse(queryBuf, null, true); // NXDOMAIN
         this._writeToSocketSab(entry, response);
       } else {
-        // Cache ip→hostname so connect() can pass hostname to relay
         this._dnsCache.set(ip, hostname);
-        const response = this._buildDnsResponse(queryBuf, ip);
+        const response = this._buildDnsResponse(queryBuf, ip, false);
         this._writeToSocketSab(entry, response);
       }
     } catch (err) {
@@ -272,32 +292,32 @@ export class AtuaComputer {
     Atomics.notify(entry.control, 1);
   }
 
-  /** Parse hostname from DNS wire format query (offset 12 = start of QNAME) */
-  _parseDnsQueryName(buf) {
-    if (buf.length < 17) return null; // minimum: 12-byte header + 1-byte label + 1-byte end + 4-byte qtype/qclass
+  /** Parse hostname and QTYPE from DNS wire format query */
+  _parseDnsQuery(buf) {
+    if (buf.length < 17) return null;
     let offset = 12; // skip DNS header
     const labels = [];
     while (offset < buf.length) {
       const len = buf[offset];
       if (len === 0) break;
-      if (len > 63) return null; // compressed — shouldn't appear in queries
+      if (len > 63) return null;
       offset++;
       if (offset + len > buf.length) return null;
       labels.push(new TextDecoder().decode(buf.subarray(offset, offset + len)));
       offset += len;
     }
-    return labels.join('.');
+    offset++; // skip null terminator
+    const qtype = (offset + 1 < buf.length) ? (buf[offset] << 8) | buf[offset + 1] : 1;
+    return { hostname: labels.join('.'), qtype };
   }
 
-  /** Build a DNS wire format response with a single A record answer */
-  _buildDnsResponse(queryBuf, ip) {
-    // Copy query header (12 bytes) + question section
+  /** Build a DNS wire format response with optional A record answer */
+  _buildDnsResponse(queryBuf, ip, nxdomain) {
     const header = new Uint8Array(queryBuf.subarray(0, 12));
-    // Set response flags: QR=1, AA=0, TC=0, RD=1, RA=1, RCODE=0 (or 3 for NXDOMAIN)
     header[2] = 0x81; // QR=1, RD=1
-    header[3] = ip ? 0x80 : 0x83; // RA=1, RCODE=0 or 3 (NXDOMAIN)
-    // ANCOUNT = 1 if we have an answer, 0 otherwise
-    header[6] = 0; header[7] = ip ? 1 : 0;
+    // RCODE: 0=NOERROR (NODATA or success), 3=NXDOMAIN
+    header[3] = nxdomain ? 0x83 : 0x80;
+    header[6] = 0; header[7] = ip ? 1 : 0; // ANCOUNT
 
     // Find end of question section
     let qEnd = 12;
@@ -305,23 +325,21 @@ export class AtuaComputer {
       qEnd += queryBuf[qEnd] + 1;
     }
     qEnd += 5; // null terminator + QTYPE(2) + QCLASS(2)
-
     const question = queryBuf.subarray(12, qEnd);
 
     if (!ip) {
-      // NXDOMAIN — header + question, no answer
       const resp = new Uint8Array(12 + question.length);
       resp.set(header);
       resp.set(question, 12);
       return resp;
     }
 
-    // Build answer RR: pointer to name(2) + TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) + RDATA(4)
+    // A record answer RR
     const answer = new Uint8Array(16);
     const av = new DataView(answer.buffer);
     answer[0] = 0xC0; answer[1] = 0x0C; // pointer to name at offset 12
-    av.setUint16(2, 1, false); // TYPE = A
-    av.setUint16(4, 1, false); // CLASS = IN
+    av.setUint16(2, 1, false);  // TYPE = A
+    av.setUint16(4, 1, false);  // CLASS = IN
     av.setUint32(6, 300, false); // TTL = 300s
     av.setUint16(10, 4, false); // RDLENGTH = 4
     const ipParts = ip.split('.').map(Number);
