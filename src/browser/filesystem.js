@@ -55,6 +55,22 @@ export class VirtualFS {
       if (typeflag === 0x35 || typeflag === 53 || name.endsWith('/')) {
         // Directory
         this.dirs.add(name);
+      } else if (typeflag === 2 || typeflag === 0x32) {
+        // Symbolic link — linkname is at bytes 157-256
+        let linkname = '';
+        for (let i = 157; i < 257 && header[i]; i++) linkname += String.fromCharCode(header[i]);
+        // Resolve relative links
+        if (!linkname.startsWith('/')) {
+          const dir = name.substring(0, name.lastIndexOf('/') + 1);
+          linkname = dir + linkname;
+        }
+        if (!linkname.startsWith('/')) linkname = '/' + linkname;
+        // Normalize: remove trailing slash, collapse //
+        linkname = linkname.replace(/\/+/g, '/').replace(/\/$/, '');
+        if (!this.symlinks) this.symlinks = new Map();
+        this.symlinks.set(name, linkname);
+        // Also register as directory (most symlinks in Debian are dir symlinks)
+        this.dirs.add(name);
       } else if (typeflag === 0 || typeflag === 0x30 || typeflag === 48) {
         // Regular file
         if (size > 0 && offset + size <= data.length) {
@@ -78,6 +94,36 @@ export class VirtualFS {
     this.files.set(path, content instanceof Uint8Array ? content : new Uint8Array(content));
   }
 
+  /** Normalize a path: resolve . and .. components */
+  normalizePath(path) {
+    const parts = path.split('/');
+    const result = [];
+    for (const p of parts) {
+      if (p === '' || p === '.') continue;
+      if (p === '..') { result.pop(); continue; }
+      result.push(p);
+    }
+    return '/' + result.join('/');
+  }
+
+  /** Resolve symlinks in a path. /bin/bash → /usr/bin/bash if /bin → usr/bin */
+  resolvePath(path, depth = 0) {
+    if (!this.symlinks || this.symlinks.size === 0 || depth > 10) return path;
+    path = this.normalizePath(path);
+    const parts = path.split('/');
+    for (let i = 1; i <= parts.length; i++) {
+      const prefix = parts.slice(0, i).join('/');
+      const target = this.symlinks.get(prefix);
+      if (target) {
+        const rest = parts.slice(i).join('/');
+        let resolved = rest ? target + '/' + rest : target;
+        resolved = this.normalizePath(resolved);
+        return this.resolvePath(resolved, depth + 1);
+      }
+    }
+    return path;
+  }
+
   /** Check if a path exists */
   exists(path) {
     return this.files.has(path) || this.dirs.has(path);
@@ -85,8 +131,9 @@ export class VirtualFS {
 
   /** Open a file, returns fd or -1 */
   open(path, flags, mode) {
-    // Normalize
+    // Normalize and resolve symlinks
     if (!path.startsWith('/')) path = '/' + path;
+    path = this.resolvePath(path);
 
     let content = this.files.get(path);
 
@@ -151,6 +198,7 @@ export class VirtualFS {
   /** Stat a path — returns size or -1 */
   stat(path) {
     if (!path.startsWith('/')) path = '/' + path;
+    path = this.resolvePath(path);
     const content = this.files.get(path);
     if (content) return { size: content.length, type: 'file' };
     if (this.dirs.has(path)) return { size: 0, type: 'dir' };

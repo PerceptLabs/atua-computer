@@ -154,6 +154,12 @@ async function bootEngine(opts) {
 
   if (opts.rootfsTar) {
     await vfs.loadTar(opts.rootfsTar);
+    // Debug: check if key files loaded
+    const bashFile = vfs.files.get('/bin/bash');
+    self.postMessage({ type: 'debug', message: `VFS loaded: ${vfs.files.size} files, /bin/bash = ${bashFile ? bashFile.length + ' bytes' : 'MISSING'}` });
+    if (bashFile && bashFile.length >= 4) {
+      self.postMessage({ type: 'debug', message: `bash magic: ${bashFile[0].toString(16)} ${bashFile[1].toString(16)} ${bashFile[2].toString(16)} ${bashFile[3].toString(16)}` });
+    }
   }
   if (opts.files) {
     for (const [path, content] of Object.entries(opts.files)) {
@@ -252,7 +258,15 @@ function createImports(args, env, getCwd, setCwd) {
 
     fs_open(pathPtr, flags, mode) {
       const path = readCString(pathPtr);
-      return vfs.open(path, flags, mode);
+      const fd = vfs.open(path, flags, mode);
+      if (fd >= 0 && (path.includes('bash') || path.includes('.so'))) {
+        const file = vfs.openFiles.get(fd);
+        if (file && file.content.length > 4) {
+          const h = file.content;
+          self.postMessage({ type: 'debug', message: `fs_open ${path} fd=${fd} len=${h.length} magic=${h[0].toString(16)} ${h[1].toString(16)} ${h[2].toString(16)} ${h[3].toString(16)}` });
+        }
+      }
+      return fd;
     },
 
     fs_read(handle, bufPtr, len, offset) {
@@ -430,7 +444,16 @@ function createImports(args, env, getCwd, setCwd) {
         }
         case 2: { // SYS_open(path, flags, mode)
           const path = readCString(a);
-          return vfs.open(path, b, c);
+          const fd = vfs.open(path, b, c);
+          if (fd >= 0) {
+            const file = vfs.openFiles.get(fd);
+            if (file && file.content.length > 4) {
+              const h = file.content;
+              if (path.includes('bash') || path.includes('.so'))
+                console.log(`[open] ${path} fd=${fd} len=${h.length} magic=${h[0].toString(16)} ${h[1].toString(16)} ${h[2].toString(16)} ${h[3].toString(16)}`);
+            }
+          }
+          return fd;
         }
         case 3: { // SYS_close(fd)
           vfs.close(a);
@@ -518,7 +541,10 @@ function createImports(args, env, getCwd, setCwd) {
         }
         case 257: { // SYS_openat(dirfd, path, flags, mode)
           const path = readCString(b);
-          return vfs.open(path, c, d);
+          const fd = vfs.open(path, c, d);
+          if (path.includes('bash') || path.includes('ld-linux'))
+            self.postMessage({ type: 'debug', message: `openat ${path} → ${fd}` });
+          return fd;
         }
 
         /* Stat */

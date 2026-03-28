@@ -25,7 +25,7 @@
     const dnsProxy = params.get('dns');
     const echoPort = params.get('echoPort') || '80';
     const binary = params.get('bin') || '/bin/bash';
-    const defaultScript = 'echo ROOTFS-OK';
+    const defaultScript = 'echo STEP1PASS; apt update 2>&1 | tail -3; echo DONE';
     const extraArgs = params.get('args') ? params.get('args').split(',') :
       ['--norc', '--noprofile', '-c', defaultScript];
 

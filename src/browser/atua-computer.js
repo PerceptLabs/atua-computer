@@ -35,9 +35,11 @@ export class AtuaComputer {
     // Load rootfs tar
     let rootfsTar = null;
     if (opts.rootfsUrl) {
+      console.log('Fetching rootfs:', opts.rootfsUrl);
       rootfsTar = typeof opts.rootfsUrl === 'string'
         ? await fetch(opts.rootfsUrl).then(r => r.arrayBuffer())
         : (opts.rootfsUrl instanceof ArrayBuffer ? opts.rootfsUrl : opts.rootfsUrl.buffer.slice(opts.rootfsUrl.byteOffset, opts.rootfsUrl.byteOffset + opts.rootfsUrl.byteLength));
+      console.log('Rootfs loaded:', rootfsTar.byteLength, 'bytes');
     }
 
     // Prepare individual files

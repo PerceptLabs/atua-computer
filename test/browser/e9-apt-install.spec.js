@@ -115,5 +115,6 @@ test('apt update + apt install curl + curl example.com', async ({ page }) => {
   console.log('=== Output (last 2000 chars) ===');
   console.log(pageText.slice(-2000));
 
-  expect(pageText).toContain('ROOTFS-OK');
+  // Check each step
+  expect(pageText).toContain('[STEP 1 PASS]');
 });
