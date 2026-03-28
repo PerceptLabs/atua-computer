@@ -52,9 +52,11 @@ export class AtuaComputer {
 
     // Initialize Wisp relay if URL provided
     if (opts.wispRelayUrl) {
+      console.log('Connecting to Wisp relay:', opts.wispRelayUrl);
       const { WispClient } = await import('./wisp-client.js');
       this._wisp = new WispClient(opts.wispRelayUrl);
       await this._wisp.connect();
+      console.log('Wisp relay connected');
     }
     this._dnsProxyUrl = opts.dnsProxyUrl || null;
 

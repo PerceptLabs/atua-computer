@@ -33,8 +33,9 @@ export class WispClient {
     return new Promise((resolve, reject) => {
       this._ws = new WebSocket(this._relayUrl);
       this._ws.binaryType = 'arraybuffer';
-      this._ws.onopen = () => resolve();
-      this._ws.onerror = (e) => reject(new Error('Wisp relay connection failed'));
+      const timeout = setTimeout(() => reject(new Error('Wisp relay connect timeout')), 5000);
+      this._ws.onopen = () => { clearTimeout(timeout); resolve(); };
+      this._ws.onerror = (e) => { clearTimeout(timeout); reject(new Error('Wisp relay connection failed')); };
       this._ws.onclose = () => this._handleWsClose();
       this._ws.onmessage = (e) => this._onMessage(e.data);
     });
