@@ -350,6 +350,8 @@ function createImports(args, env, getCwd, setCwd) {
        syscall_arch.h maps this to atua.host_syscall. Linux x86-64 numbers. */
 
     host_syscall(n, a, b, c, d, e, f) {
+      // Log last HOST syscall for debugging hangs
+      self._lastSyscall = n;
       switch (n) {
         /* Memory — must work before anything else (malloc depends on these) */
         case 12: { // SYS_brk
@@ -645,9 +647,12 @@ function createImports(args, env, getCwd, setCwd) {
           return 0;
         }
 
-        /* Exit */
+        /* Exit / abort */
         case 60:  // SYS_exit
         case 231: // SYS_exit_group
+        case 62:  // SYS_kill (abort sends SIGABRT via kill)
+        case 200: // SYS_tkill
+        case 234: // SYS_tgkill
           throw new WebAssembly.RuntimeError('unreachable');
 
         /* Everything else */
@@ -986,7 +991,7 @@ function createImports(args, env, getCwd, setCwd) {
       self.postMessage({ type: 'socket-connect', sockId: id, ip, port });
       // Block until main thread signals connect result
       while (Atomics.load(sock.control, 3) === 0) {
-        Atomics.wait(sock.control, 3, 0, 30000);
+        Atomics.wait(sock.control, 3, 0, 5000);
       }
       const result = Atomics.load(sock.control, 3);
       return result === 1 ? 0 : -1;

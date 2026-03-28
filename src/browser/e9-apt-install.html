@@ -41,6 +41,7 @@
         env: { HOME: '/' },
         files: {
           '/etc/resolv.conf': new TextEncoder().encode('nameserver 1.1.1.1\n'),
+          '/etc/nsswitch.conf': new TextEncoder().encode('hosts: files\n'),
         },
         wispRelayUrl: relayUrl || undefined,
         dnsProxyUrl: dnsProxy || undefined,
