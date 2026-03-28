@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — blinkenlights guest test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — blinkenlights guest</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg) { output.textContent += msg; }
+
+    const params = new URLSearchParams(location.search);
+    const binary = params.get('bin') || '/usr/bin/blinkenlights';
+    const extraArgs = params.get('args') ? params.get('args').split(',') : ['-e', '/hello_test.elf'];
+
+    try {
+      const computer = new AtuaComputer();
+      log('Booting engine...\n');
+      log('Binary: ' + binary + ' ' + extraArgs.join(' ') + '\n');
+
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-mini.tar',
+        args: ['engine', binary, ...extraArgs],
+        env: { HOME: '/', TERM: 'xterm-256color' },
+        onOutput: (bytes) => {
+          log(new TextDecoder().decode(bytes));
+        },
+      });
+
+      log('\n[Tests complete]\n');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('\n[Tests complete]\n');
+      } else {
+        log('\nERROR: ' + err.message + '\n');
+      }
+    }
+  </script>
+</body>
+</html>

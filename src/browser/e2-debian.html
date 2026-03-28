@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — Debian 13 bash test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+    .info { color: #a8d8ea; }
+    .success { color: #4ecca3; }
+    .error { color: #e84545; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — Debian 13 bash in browser</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg, cls = '') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = msg + '\n';
+      output.appendChild(span);
+    }
+
+    try {
+      log('Loading Debian rootfs...', 'info');
+      const computer = new AtuaComputer();
+
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-mini.tar',
+        args: ['engine', '/bin/bash', '--norc', '--noprofile', '-c', 'echo debian-browser-works'],
+        env: { BLINK_PREFIX: '' },
+        onOutput: (bytes) => {
+          const text = new TextDecoder().decode(bytes);
+          log(text, 'success');
+        },
+      });
+
+      log('Engine exited.', 'info');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('Engine exited cleanly.', 'info');
+      } else {
+        log('ERROR: ' + err.message, 'error');
+        if (err.stack) log(err.stack, 'error');
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+    .info { color: #a8d8ea; }
+    .success { color: #4ecca3; }
+    .error { color: #e84545; }
+    h1 { color: #e8e8e8; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — browser engine (12 atua imports, zero WASI)</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg, cls = '') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = msg + '\n';
+      output.appendChild(span);
+    }
+
+    try {
+      log('Fetching hello.elf...', 'info');
+      const elfResp = await fetch('/hello.elf');
+      if (!elfResp.ok) throw new Error('Failed to fetch hello.elf: ' + elfResp.status);
+      const elfBytes = new Uint8Array(await elfResp.arrayBuffer());
+      log(`ELF loaded: ${elfBytes.length} bytes`, 'info');
+
+      const computer = new AtuaComputer();
+
+      log('Booting engine (7 atua imports, zero WASI)...', 'info');
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        args: ['engine', '/hello.elf'],
+        files: {
+          '/hello.elf': elfBytes,
+          'hello.elf': elfBytes,
+        },
+        onOutput: (bytes) => {
+          const text = new TextDecoder().decode(bytes);
+          log(text, 'success');
+        },
+      });
+
+      log('Engine exited cleanly.', 'info');
+    } catch (err) {
+      log('ERROR: ' + err.message, 'error');
+      if (err.stack) log(err.stack, 'error');
+    }
+  </script>
+</body>
+</html>
