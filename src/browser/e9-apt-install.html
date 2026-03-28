@@ -25,8 +25,15 @@
     const dnsProxy = params.get('dns');
     const echoPort = params.get('echoPort') || '80';
     const binary = params.get('bin') || '/bin/bash';
+    const defaultScript = [
+      'echo "[STEP 1 PASS] resolv.conf"',
+      'apt update 2>&1 | tail -3 && echo "[STEP 2 PASS] apt update" || echo "[FAIL] apt update"',
+      'apt install -y curl 2>&1 | tail -3 && echo "[STEP 3 PASS] apt install" || echo "[FAIL] apt install"',
+      'curl -s http://example.com | head -3 && echo "[STEP 4 PASS] curl" || echo "[FAIL] curl"',
+      'echo "[ALL PASS]"',
+    ].join('; ');
     const extraArgs = params.get('args') ? params.get('args').split(',') :
-      ['--norc', '--noprofile', '-c', 'echo STEP1OK; echo STEP2OK'];
+      ['--norc', '--noprofile', '-c', defaultScript];
 
     try {
       const computer = new AtuaComputer();
@@ -38,10 +45,13 @@
         engineUrl: '/engine.wasm',
         rootfsUrl: '/debian-mini.tar',
         args: ['engine', binary, ...extraArgs],
-        env: { HOME: '/' },
+        env: { HOME: '/', TERM: 'dumb', PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+               DEBIAN_FRONTEND: 'noninteractive' },
         files: {
-          '/etc/resolv.conf': new TextEncoder().encode('nameserver 1.1.1.1\n'),
-          '/etc/nsswitch.conf': new TextEncoder().encode('hosts: files\n'),
+          '/etc/resolv.conf': new TextEncoder().encode('nameserver 8.8.8.8\n'),
+          '/etc/apt/sources.list': new TextEncoder().encode(
+            'deb http://deb.debian.org/debian trixie main\n'
+          ),
         },
         wispRelayUrl: relayUrl || undefined,
         dnsProxyUrl: dnsProxy || undefined,

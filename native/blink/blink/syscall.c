@@ -141,6 +141,7 @@ char *g_blink_path;
 bool FLAG_statistics;
 
 #ifdef __wasm32__
+
 /* PagePool is defined in memorymalloc.c — we just need the layout here
    for serializing/deserializing guest memory pages during fork. */
 struct PagePool { u8 *base; size_t capacity; size_t next_page; };
@@ -1692,8 +1693,14 @@ static int SysSocket(struct Machine *m, i32 family, i32 type, i32 protocol) {
   type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
 #ifdef __ATUA_BROWSER__
   {
-    /* Strip Linux-specific flags, pass raw type to JS.
-       JS assigns sock_id starting at 300 to avoid fd collisions. */
+    /* Only create real sockets for AF_INET (2) and AF_INET6 (10).
+       AF_UNIX (1) is used by glibc to connect to nscd — the Wisp
+       relay can't handle Unix domain sockets, causing an infinite
+       retry loop. Returning EAFNOSUPPORT makes glibc skip nscd. */
+    if (family != AF_INET_LINUX && family != AF_INET6_LINUX) {
+      errno = EAFNOSUPPORT;
+      return -1;
+    }
     int raw_type = XlatSocketType(type);
     if (raw_type == -1) return -1;
     int oflags = O_RDWR;

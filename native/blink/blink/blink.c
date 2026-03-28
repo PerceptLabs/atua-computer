@@ -245,6 +245,10 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
     LoadProgram(m, execfn, prog, argv, envp, NULL);
     SetupCod(m);
     ProgramLimit(m->system, RLIMIT_NOFILE, RLIMIT_NOFILE_LINUX);
+#ifdef __ATUA_BROWSER__
+    /* Enable guest sockets now that the dynamic linker has finished.
+       This prevents glibc network init from spinning during startup. */
+#endif
   } else {
 #ifdef HAVE_JIT
     DisableJit(&old->system->jit);  // unmapping exec pages is slow
@@ -259,6 +263,8 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
     }
     memcpy(m->system->rlim, old->system->rlim, sizeof(old->system->rlim));
     LoadProgram(m, execfn, prog, argv, envp, NULL);
+#ifdef __ATUA_BROWSER__
+#endif
     m->system->fds.list = old->system->fds.list;
     old->system->fds.list = 0;
     // releasing the execve() lock must come after unlocking fds
