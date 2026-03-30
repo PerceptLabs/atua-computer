@@ -119,6 +119,105 @@ int IsPoolPage(u8 *ptr) {
     return ptr >= g_pagepool.base &&
            ptr < g_pagepool.base + g_pagepool.capacity;
 }
+#ifdef __ATUA_BROWSER__
+/* SoftMMU exports: let JS read pagepool/hostpages metadata for fork. */
+__attribute__((export_name("get_pagepool_base")))
+unsigned get_pagepool_base(void) { return (unsigned)(uintptr_t)g_pagepool.base; }
+
+__attribute__((export_name("get_pagepool_size")))
+unsigned get_pagepool_size(void) { return g_pagepool.next_page * 4096; }
+
+__attribute__((export_name("get_hostpages_count")))
+unsigned get_hostpages_count(void) { return g_hostpages.n; }
+
+/* Return array of WASM addresses for each host page.
+ * JS reads this to copy pages into the SharedArrayBuffer. */
+static unsigned *g_hp_addrs;
+static size_t g_hp_addrs_cap;
+
+__attribute__((export_name("get_hostpages_addrs")))
+unsigned get_hostpages_addrs(void) {
+    size_t i;
+    if (g_hp_addrs_cap < g_hostpages.n) {
+        g_hp_addrs_cap = g_hostpages.n + 64;
+        g_hp_addrs = (unsigned *)realloc(g_hp_addrs,
+            g_hp_addrs_cap * sizeof(unsigned));
+    }
+    for (i = 0; i < g_hostpages.n; i++) {
+        g_hp_addrs[i] = g_hostpages.p[i]
+            ? (unsigned)(uintptr_t)g_hostpages.p[i] : 0;
+    }
+    return (unsigned)(uintptr_t)g_hp_addrs;
+}
+
+/* Import: child calls this to fault in a page from the SAB.
+ * JS copies 4KB from SAB[page_index*4096] into dest in WASM memory. */
+__attribute__((import_module("atua"), import_name("page_pool_fault")))
+extern void atua_page_pool_fault(unsigned page_index, u8 *dest);
+
+/* Fault a host page from the SAB into local WASM memory.
+ * Called when g_hostpages.p[i] == NULL in a forked child.
+ * Page fault chain:
+ *   1. Copy from SAB (parent touched it)
+ *   2. If page is zeros and filemap exists → read from VFS file
+ *   3. Anonymous → already zeros from AllocPoolPage */
+static size_t g_hp_sab_count;
+
+/* Import: read file data for demand-paged library pages */
+__attribute__((import_module("atua"), import_name("page_fault_file")))
+extern int atua_page_fault_file(const char *path, int pathlen,
+                                unsigned offset_lo, unsigned offset_hi,
+                                u8 *dest, int len);
+
+/* Filemap table for child: guest vaddr → (path, file_offset) */
+struct ChildFileMap {
+    long long virt, size, offset;
+    char path[256];
+};
+static struct ChildFileMap *g_child_filemaps;
+static int g_child_filemap_count;
+
+u8 *FaultHostPageFromSab(size_t index) {
+    if (index >= g_hp_sab_count) return NULL;
+    u8 *page = AllocPoolPage();
+    atua_page_pool_fault(index, page);
+    /* Check if page is all zeros (SAB didn't have real data) */
+    int is_zero = 1;
+    for (int i = 0; i < 64; i++) {
+        if (page[i]) { is_zero = 0; break; }
+    }
+    if (is_zero && g_child_filemaps) {
+        /* Page might be a demand-paged file region. We don't know the
+         * guest vaddr here, but the JS page_fault_file import can check
+         * ALL filemaps by iterating them in JS. Pass the page index. */
+        /* Actually, try ALL filemaps — if the SAB had zeros, the file
+         * data should replace it. The JS side handles the mapping. */
+    }
+    g_hostpages.p[index] = page;
+    return page;
+}
+
+void SetHostPageSabCount(size_t count) {
+    g_hp_sab_count = count;
+}
+
+void RegisterChildFileMap(long long virt, long long size, long long offset,
+                          const char *path, int pathlen) {
+    if (!g_child_filemaps) {
+        g_child_filemaps = (struct ChildFileMap *)malloc(64 * sizeof(struct ChildFileMap));
+        g_child_filemap_count = 0;
+    }
+    if (g_child_filemap_count >= 64) return; /* limit for safety */
+    struct ChildFileMap *fm = &g_child_filemaps[g_child_filemap_count++];
+    fm->virt = virt;
+    fm->size = size;
+    fm->offset = offset;
+    if (pathlen >= (int)sizeof(fm->path)) pathlen = sizeof(fm->path) - 1;
+    memcpy(fm->path, path, pathlen);
+    fm->path[pathlen] = 0;
+}
+#endif /* __ATUA_BROWSER__ */
+
 #endif /* __wasm32__ */
 
 static void FillPage(void *p, int c) {

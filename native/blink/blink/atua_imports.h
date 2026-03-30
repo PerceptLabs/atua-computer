@@ -82,6 +82,11 @@ extern int atua_socket_poll(int sock_id);
 __attribute__((import_module("atua"), import_name("fork_spawn")))
 extern int atua_fork_spawn(const void *state_buf, int state_len);
 
+__attribute__((import_module("atua"), import_name("fork_exec_spawn")))
+extern int atua_fork_exec_spawn(int pid, const char *path,
+                                const char *argv_packed, int argv_len,
+                                const char *envp_packed, int envp_len);
+
 __attribute__((import_module("atua"), import_name("proc_wait")))
 extern int atua_proc_wait(int pid, int *status);
 

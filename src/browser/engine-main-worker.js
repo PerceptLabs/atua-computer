@@ -287,7 +287,13 @@ function createImports(args, env, getCwd, setCwd) {
 
     fs_fstat(handle) {
       const file = vfs.openFiles.get(handle);
-      return file ? BigInt(file.content.length) : BigInt(-1);
+      if (!file && handle > 2) return BigInt(-1);
+      if (!file) return BigInt(0);
+      const size = BigInt(file.content?.length || 0);
+      let mode = 0o100755;
+      if (file.isDir) mode = 0o40755;
+      else if (file.special === 'null' || file.special === 'urandom') mode = 0o20666;
+      return (size << 16n) | BigInt(mode);
     },
 
     fs_stat(pathPtr, bufPtr, bufLen) {
@@ -309,6 +315,11 @@ function createImports(args, env, getCwd, setCwd) {
       const buf = new Uint8Array(memory.buffer, bufPtr, len);
       crypto.getRandomValues(buf);
     },
+
+    // SoftMMU: stub for parent (never called — parent has its own pagepool).
+    // Child worker provides the real implementation that copies from SAB.
+    page_pool_fault() {},
+    register_filemap() {}, // parent doesn't need filemap registration
 
     clock_gettime() {
       return BigInt(Math.floor(Date.now() * 1000000));
@@ -430,14 +441,16 @@ function createImports(args, env, getCwd, setCwd) {
           file.position += n2;
           return n2;
         }
-        case 1: { // SYS_write(fd, buf, count)
+        case 1: { // SYS_write(fd, buf, count) [1a] O_APPEND aware
           const buf = new Uint8Array(memory.buffer, b >>> 0, c >>> 0);
-          if (a === 1 || a === 2) {
+          const file = vfs.openFiles.get(a);
+          if (a === 1 || a === 2 || file?.special === 'stdout' || file?.special === 'stderr') {
             self.postMessage({ type: 'stdout', data: new Uint8Array(buf) });
             return c;
           }
-          const file = vfs.openFiles.get(a);
           if (!file) return -9;
+          if (file.special === 'null') return c;
+          if (file.append) file.position = file.content.length; // [1a]
           vfs.write(a, buf, file.position);
           file.position += c;
           return c;
@@ -459,19 +472,36 @@ function createImports(args, env, getCwd, setCwd) {
           vfs.close(a);
           return 0;
         }
-        case 5: { // SYS_fstat(fd, statbuf)
+        case 5: { // SYS_fstat(fd, statbuf) — wasm32 struct kstat (112 bytes)
+          // kstat layout: st_dev(8) st_ino(8) st_nlink(4) st_mode(4)
+          //   st_uid(4) st_gid(4) __pad(4) [pad4] st_rdev(8) st_size(8)
+          //   st_blksize(4) [pad4] st_blocks(8) atime_sec(4) atime_ns(4)
+          //   mtime_sec(4) mtime_ns(4) ctime_sec(4) ctime_ns(4) unused(12) [pad4]
           const file = vfs.openFiles.get(a);
-          const size = file ? file.content.length : 0;
+          const size = file ? (file.content?.length || 0) : 0;
+          const buf = b >>> 0;
+          new Uint8Array(memory.buffer, buf, 112).fill(0);
           const view = new DataView(memory.buffer);
-          // wasm32 musl struct stat: 128 bytes
-          // st_dev=0, st_ino=8, st_mode=16, st_nlink=20, st_size=48
-          new Uint8Array(memory.buffer, b >>> 0, 128).fill(0);
-          view.setBigUint64(b + 0, 1n, true);     // st_dev
-          view.setBigUint64(b + 8, BigInt(a + 1000), true); // st_ino
-          view.setUint32(b + 16, 0o100755, true);  // st_mode
-          view.setUint32(b + 20, 1, true);         // st_nlink
-          view.setBigInt64(b + 48, BigInt(size), true); // st_size
-          view.setBigInt64(b + 56, 4096n, true);   // st_blksize
+          const meta = file?.path ? (vfs.metadata.get(file.path) || {}) : {};
+          let typeBits = 0o100000;
+          let nlink = 1;
+          if (file?.isDir) { typeBits = 0o40000; nlink = 2; }
+          if (file?.special === 'null' || file?.special === 'urandom') typeBits = 0o20000;
+          if (file?.special === 'stdout' || file?.special === 'stderr' || file?.special === 'stdin') typeBits = 0o20000; // char device
+          const permBits = (meta.mode !== undefined) ? (meta.mode & 0o7777) : (typeBits === 0o20000 ? 0o666 : 0o755);
+          const now = vfs.bootTime;
+          view.setBigUint64(buf + 0, 1n, true);                    // st_dev
+          view.setBigUint64(buf + 8, BigInt(a + 1000), true);      // st_ino
+          view.setUint32(buf + 16, nlink, true);                   // st_nlink
+          view.setUint32(buf + 20, typeBits | permBits, true);     // st_mode
+          view.setUint32(buf + 24, meta.uid || 0, true);           // st_uid
+          view.setUint32(buf + 28, meta.gid || 0, true);           // st_gid
+          view.setBigInt64(buf + 48, BigInt(size), true);           // st_size
+          view.setInt32(buf + 56, 4096, true);                     // st_blksize
+          view.setBigInt64(buf + 64, BigInt(Math.ceil(size / 512)), true); // st_blocks
+          view.setInt32(buf + 72, meta.atime || now, true);        // st_atime_sec
+          view.setInt32(buf + 80, meta.mtime || now, true);        // st_mtime_sec
+          view.setInt32(buf + 88, meta.mtime || now, true);        // st_ctime_sec
           return a <= 2 || file ? 0 : -9;
         }
         case 8: { // SYS_lseek(fd, offset, whence)
@@ -548,34 +578,45 @@ function createImports(args, env, getCwd, setCwd) {
         }
 
         /* Stat */
-        case 4: { // SYS_stat
-          const path = readCString(a);
-          const info = vfs.stat(path);
-          if (!info) return -2;
-          new Uint8Array(memory.buffer, b >>> 0, 128).fill(0);
+        case 4: case 6: case 262: { // SYS_stat/lstat/fstatat
+          // stat(path=a, buf=b), lstat(path=a, buf=b), fstatat(dirfd=a, path=b, buf=c, flags=d)
+          const pathArg = n === 262 ? b : a;
+          const bufArg = n === 262 ? c : b;
+          const flags = n === 262 ? (d >>> 0) : 0;
+          let path = readCString(pathArg);
+          if (!path.startsWith('/')) path = '/' + path;
+          // lstat (case 6) or AT_SYMLINK_NOFOLLOW (0x100): don't follow symlinks
+          const followSymlinks = (n !== 6) && !(flags & 0x100);
+          const info = vfs.stat(path, followSymlinks);
+          if (!info) return -2; // ENOENT
+          const buf = bufArg >>> 0;
+          // wasm32 struct kstat (112 bytes): st_nlink at 16, st_mode at 20!
+          new Uint8Array(memory.buffer, buf, 112).fill(0);
           const view = new DataView(memory.buffer);
-          view.setUint32(b + 16, info.type === 'dir' ? 0o40755 : 0o100755, true);
-          view.setBigInt64(b + 48, BigInt(info.size), true);
-          return 0;
-        }
-        case 6: { // SYS_lstat — same as stat (no symlinks in VFS)
-          const path = readCString(a);
-          const info = vfs.stat(path);
-          if (!info) return -2;
-          new Uint8Array(memory.buffer, b >>> 0, 128).fill(0);
-          const view = new DataView(memory.buffer);
-          view.setUint32(b + 16, info.type === 'dir' ? 0o40755 : 0o100755, true);
-          view.setBigInt64(b + 48, BigInt(info.size), true);
-          return 0;
-        }
-        case 262: { // SYS_fstatat/newfstatat(dirfd, path, statbuf, flags)
-          const path = readCString(b);
-          const info = vfs.stat(path);
-          if (!info) return -2;
-          new Uint8Array(memory.buffer, c >>> 0, 128).fill(0);
-          const view = new DataView(memory.buffer);
-          view.setUint32(c + 16, info.type === 'dir' ? 0o40755 : 0o100755, true);
-          view.setBigInt64(c + 48, BigInt(info.size), true);
+          const meta = vfs.metadata.get(followSymlinks ? vfs.resolvePath(path) : path) || {};
+          let typeBits;
+          let nlink = 1;
+          if (info.type === 'dir') { typeBits = 0o40000; nlink = 2; }
+          else if (info.type === 'symlink') { typeBits = 0o120000; }
+          else if (info.type === 'chardev') { typeBits = 0o20000; }
+          else { typeBits = 0o100000; }
+          const permBits = (meta.mode !== undefined) ? (meta.mode & 0o7777)
+                         : (typeBits === 0o20000 ? 0o666 : 0o755);
+          let ino = 0; for (let i = 0; i < path.length; i++) ino = ((ino << 5) - ino + path.charCodeAt(i)) >>> 0;
+          const now = vfs.bootTime;
+          view.setBigUint64(buf + 0, 1n, true);                        // st_dev
+          view.setBigUint64(buf + 8, BigInt(ino || 1), true);           // st_ino
+          view.setUint32(buf + 16, nlink, true);                       // st_nlink
+          view.setUint32(buf + 20, typeBits | permBits, true);         // st_mode
+          view.setUint32(buf + 24, meta.uid || 0, true);               // st_uid
+          view.setUint32(buf + 28, meta.gid || 0, true);               // st_gid
+          view.setBigInt64(buf + 48, BigInt(info.size), true);          // st_size
+          view.setInt32(buf + 56, 4096, true);                         // st_blksize
+          view.setBigInt64(buf + 64, BigInt(Math.ceil(info.size / 512)), true); // st_blocks
+          view.setInt32(buf + 72, meta.atime || now, true);            // st_atime_sec
+          view.setInt32(buf + 80, meta.mtime || now, true);            // st_mtime_sec
+          view.setInt32(buf + 88, meta.mtime || now, true);            // st_ctime_sec
+          view.setBigInt64(buf + 104, BigInt(meta.mtime || now), true); // st_ctime
           return 0;
         }
 
@@ -632,14 +673,48 @@ function createImports(args, env, getCwd, setCwd) {
 
         /* Filesystem metadata */
         case 16: return -25;  // SYS_ioctl → ENOTTY (HOST ioctl, not guest)
-        case 72: { // SYS_fcntl(fd, cmd, arg)
-          const F_DUPFD = 0, F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4;
-          const F_DUPFD_CLOEXEC = 1030;
-          if (b === F_GETFD || b === F_SETFD) return 0;
-          if (b === F_GETFL) return 0; // O_RDONLY
-          if (b === F_SETFL) return 0;
-          if (b === F_DUPFD || b === F_DUPFD_CLOEXEC) return a; // return same fd
+        case 72: { // SYS_fcntl(fd=a, cmd=b, arg=c) [1e] real dup
+          const file = vfs.openFiles.get(a);
+          if (!file) return -9;
+          if (b === 0 || b === 1030) { // F_DUPFD / F_DUPFD_CLOEXEC
+            const newFd = vfs.nextFd++;
+            vfs.openFiles.set(newFd, {
+              content: file.content, position: file.position, path: file.path,
+              isDir: file.isDir, dirPath: file.dirPath, special: file.special,
+              append: file.append, cloexec: (b === 1030),
+            });
+            return newFd;
+          }
+          if (b === 1) return file.cloexec ? 1 : 0; // F_GETFD
+          if (b === 2) { file.cloexec = !!(c & 1); return 0; } // F_SETFD
+          if (b === 3) { let fl = 0; if (file.append) fl |= 0x400; return fl; } // F_GETFL
+          if (b === 4) return 0; // F_SETFL
           return 0;
+        }
+        case 32: { // SYS_dup(oldfd)
+          const file = vfs.openFiles.get(a);
+          if (!file) return -9;
+          const newFd = vfs.nextFd++;
+          vfs.openFiles.set(newFd, { ...file, cloexec: false });
+          return newFd;
+        }
+        case 33: { // SYS_dup2(oldfd, newfd)
+          if (a === b) return b;
+          const file = vfs.openFiles.get(a);
+          if (!file) return -9;
+          vfs.openFiles.delete(b);
+          vfs.openFiles.set(b, { ...file, cloexec: false });
+          if (b >= vfs.nextFd) vfs.nextFd = b + 1;
+          return b;
+        }
+        case 292: { // SYS_dup3(oldfd, newfd, flags)
+          if (a === b) return -22; // EINVAL
+          const file = vfs.openFiles.get(a);
+          if (!file) return -9;
+          vfs.openFiles.delete(b);
+          vfs.openFiles.set(b, { ...file, cloexec: !!(c & 0x80000) });
+          if (b >= vfs.nextFd) vfs.nextFd = b + 1;
+          return b;
         }
         case 79: { // SYS_getcwd(buf, size)
           const cwd = getCwd();
@@ -695,10 +770,8 @@ function createImports(args, env, getCwd, setCwd) {
         case 234: // SYS_tgkill
           throw new WebAssembly.RuntimeError('unreachable');
 
-        /* I/O: dup, pipe, directory, link, truncate */
-        case 32: return a;    // SYS_dup → return same fd
-        case 33: return b;    // SYS_dup2 → return newfd
-        case 292: return b;   // SYS_dup3 → return newfd
+        /* I/O: pipe, directory, link, truncate */
+        /* dup/dup2/dup3 handled above with case 32/33/292 */
         case 22: return -38;  // SYS_pipe → ENOSYS (Blink handles guest pipes)
         case 293: return -38; // SYS_pipe2 → ENOSYS (Blink handles guest pipes)
         case 18: { // SYS_pwrite64(fd, buf, count, offset_lo, offset_hi)
@@ -709,48 +782,119 @@ function createImports(args, env, getCwd, setCwd) {
           vfs.write(a, src, offset);
           return c;
         }
-        case 77: { // SYS_ftruncate(fd, length)
+        case 77: { // SYS_ftruncate(fd=a, length=b)
           const file = vfs.openFiles.get(a);
-          if (!file) return -9;
-          const newLen = b >>> 0;
-          const old = file.content;
-          if (newLen < old.length) {
-            file.content = old.subarray(0, newLen);
-          } else if (newLen > old.length) {
-            const expanded = new Uint8Array(newLen);
-            expanded.set(old);
-            file.content = expanded;
+          if (!file || file.isDir) return -9;
+          if (file.special) return 0;
+          const len = b >>> 0;
+          if (len < file.content.length) {
+            file.content = file.content.slice(0, len);
+          } else if (len > file.content.length) {
+            const grown = new Uint8Array(len);
+            grown.set(file.content);
+            file.content = grown;
           }
-          vfs.files.set(file.path, file.content);
+          if (file.path) vfs.files.set(file.path, file.content);
           return 0;
         }
-        case 83: case 258: { // SYS_mkdir / SYS_mkdirat
-          const path = readCString(n === 83 ? a : b);
-          vfs.dirs.add(path.startsWith('/') ? path : '/' + path);
+        case 83: case 258: { // SYS_mkdir(path,mode) / SYS_mkdirat(dirfd,path,mode)
+          const pathIdx = n === 83 ? 0 : 1; // a or b
+          let path = readCString(pathIdx === 0 ? a : b);
+          const mode = (pathIdx === 0 ? b : c) >>> 0;
+          if (!path.startsWith('/')) { if (pathIdx === 1 && (a|0) !== -100) return -95; path = '/' + path; }
+          path = vfs.resolvePath(path);
+          vfs.mkdir(path);
+          if (mode) vfs.metadata.set(path, { ...(vfs.metadata.get(path)||{}), mode: mode & 0o7777 });
           return 0;
         }
-        case 87: case 263: { // SYS_unlink / SYS_unlinkat
-          const path = readCString(n === 87 ? a : b);
-          const norm = path.startsWith('/') ? path : '/' + path;
-          vfs.files.delete(norm);
+        case 87: case 263: { // SYS_unlink(path) / SYS_unlinkat(dirfd,path,flags)
+          let path = readCString(n === 87 ? a : b);
+          if (!path.startsWith('/')) { if (n === 263 && (a|0) !== -100) return -95; path = '/' + path; }
+          path = vfs.resolvePath(path);
+          const flags = n === 263 ? (c >>> 0) : 0;
+          if (flags & 0x200) { vfs.rmdir(path); } else { vfs.unlink(path); }
           return 0;
         }
         case 82: case 264: case 316: { // SYS_rename / SYS_renameat / SYS_renameat2
-          const oldPath = readCString(n === 82 ? a : b);
-          const newPath = readCString(n === 82 ? b : (n === 264 ? d : d));
-          const normOld = oldPath.startsWith('/') ? oldPath : '/' + oldPath;
-          const normNew = newPath.startsWith('/') ? newPath : '/' + newPath;
-          const content = vfs.files.get(normOld);
-          if (!content) return -2;
-          vfs.files.set(normNew, content);
-          vfs.files.delete(normOld);
+          let oldPath = readCString(n === 82 ? a : b);
+          let newPath = readCString(n === 82 ? b : d);
+          if (!oldPath.startsWith('/')) { if (n !== 82 && (a|0) !== -100) return -95; oldPath = '/' + oldPath; }
+          if (!newPath.startsWith('/')) { if (n !== 82 && (c|0) !== -100) return -95; newPath = '/' + newPath; }
+          vfs.rename(vfs.resolvePath(oldPath), vfs.resolvePath(newPath));
           return 0;
         }
-        case 89: case 267: return -2; // SYS_readlink(at) → ENOENT (no symlinks)
-        case 217: { // SYS_getdents64(fd, dirp, count)
-          // Minimal: return 0 (end of directory) — VFS doesn't track dir handles
-          return 0;
+        case 89: { // SYS_readlink(path=a, buf=b, bufsiz=c)
+          let path = readCString(a);
+          if (!path.startsWith('/')) path = '/' + path;
+          if (path === '/proc/self/exe') {
+            const t = new TextEncoder().encode('/bin/bash');
+            const n2 = Math.min(t.length, c >>> 0);
+            new Uint8Array(memory.buffer, b >>> 0, n2).set(t.subarray(0, n2));
+            return n2;
+          }
+          const target = vfs.symlinks.get(path) || vfs.symlinks.get(vfs.normalizePath(path));
+          if (!target) return -22; // EINVAL
+          const enc = new TextEncoder().encode(target);
+          const n2 = Math.min(enc.length, c >>> 0);
+          new Uint8Array(memory.buffer, b >>> 0, n2).set(enc.subarray(0, n2));
+          return n2;
         }
+        case 267: { // SYS_readlinkat(dirfd=a, path=b, buf=c, bufsiz=d)
+          let path = readCString(b);
+          if (!path.startsWith('/')) { if ((a|0) !== -100) return -38; path = '/' + path; }
+          if (path === '/proc/self/exe') {
+            const t = new TextEncoder().encode('/bin/bash');
+            const n2 = Math.min(t.length, d >>> 0);
+            new Uint8Array(memory.buffer, c >>> 0, n2).set(t.subarray(0, n2));
+            return n2;
+          }
+          // /proc/self/fd/N → return path of open fd N
+          const fdMatch = path.match(/^\/proc\/self\/fd\/(\d+)$/);
+          if (fdMatch) {
+            const fdFile = vfs.openFiles.get(parseInt(fdMatch[1]));
+            const t = new TextEncoder().encode(fdFile?.path || '/');
+            const n2 = Math.min(t.length, d >>> 0);
+            new Uint8Array(memory.buffer, c >>> 0, n2).set(t.subarray(0, n2));
+            return n2;
+          }
+          const target = vfs.symlinks.get(path) || vfs.symlinks.get(vfs.normalizePath(path));
+          if (!target) return -22; // EINVAL
+          const enc = new TextEncoder().encode(target);
+          const n2 = Math.min(enc.length, d >>> 0);
+          new Uint8Array(memory.buffer, c >>> 0, n2).set(enc.subarray(0, n2));
+          return n2;
+        }
+        case 217: { // SYS_getdents64(fd=a, dirp=b, count=c)
+          const file = vfs.openFiles.get(a);
+          if (!file || !file.isDir) return -9; // EBADF
+          if (!file._dirEntries) {
+            file._dirEntries = vfs.readdir(file.dirPath);
+            file._dirOffset = 0;
+          }
+          const view = new DataView(memory.buffer);
+          const buf = b >>> 0;
+          const bufSize = c >>> 0;
+          let written = 0;
+          while (file._dirOffset < file._dirEntries.length) {
+            const entry = file._dirEntries[file._dirOffset];
+            const nameBytes = new TextEncoder().encode(entry.name);
+            const reclen = ((19 + nameBytes.length + 1 + 7) >> 3) << 3;
+            if (written + reclen > bufSize) break;
+            const off = buf + written;
+            view.setBigUint64(off, BigInt(file._dirOffset + 1), true);     // d_ino
+            view.setBigUint64(off + 8, BigInt(file._dirOffset + 2), true); // d_off
+            view.setUint16(off + 16, reclen, true);                        // d_reclen
+            const dtype = entry.type === 'dir' ? 4 : entry.type === 'symlink' ? 10 : 8;
+            new Uint8Array(memory.buffer)[off + 18] = dtype;               // d_type
+            new Uint8Array(memory.buffer, off + 19, nameBytes.length).set(nameBytes);
+            new Uint8Array(memory.buffer)[off + 19 + nameBytes.length] = 0;
+            written += reclen;
+            file._dirOffset++;
+          }
+          return written;
+        }
+        case 73: return 0; // SYS_flock — no contention
+        case 285: return 0; // SYS_fallocate — no-op
 
         /* Process/signal (single-process defaults) */
         case 21: return -2;   // SYS_access → ENOENT
@@ -808,23 +952,140 @@ function createImports(args, env, getCwd, setCwd) {
         case 160: return 0;   // SYS_setrlimit
         case 247: return -38; // SYS_waitid → ENOSYS
 
-        /* Filesystem metadata stubs */
-        case 90: return 0;    // SYS_chmod
-        case 91: return 0;    // SYS_fchmod
-        case 92: return 0;    // SYS_chown
-        case 93: return 0;    // SYS_fchown
-        case 94: return 0;    // SYS_lchown
+        /* Filesystem metadata — store in vfs.metadata for stat readback */
+        case 90: { // SYS_chmod(path=a, mode=b)
+          let path = readCString(a);
+          if (!path.startsWith('/')) path = '/' + path;
+          path = vfs.resolvePath(path);
+          vfs.metadata.set(path, { ...(vfs.metadata.get(path)||{}), mode: b >>> 0 });
+          return 0;
+        }
+        case 91: { // SYS_fchmod(fd=a, mode=b)
+          const file = vfs.openFiles.get(a);
+          if (file?.path) vfs.metadata.set(file.path, { ...(vfs.metadata.get(file.path)||{}), mode: b >>> 0 });
+          return 0;
+        }
+        case 92: { // SYS_chown(path=a, uid=b, gid=c)
+          let path = readCString(a);
+          if (!path.startsWith('/')) path = '/' + path;
+          path = vfs.resolvePath(path);
+          vfs.metadata.set(path, { ...(vfs.metadata.get(path)||{}), uid: b, gid: c });
+          return 0;
+        }
+        case 93: { // SYS_fchown(fd=a, uid=b, gid=c)
+          const file = vfs.openFiles.get(a);
+          if (file?.path) vfs.metadata.set(file.path, { ...(vfs.metadata.get(file.path)||{}), uid: b, gid: c });
+          return 0;
+        }
+        case 94: return 0;    // SYS_lchown — store metadata on symlink path
         case 132: return 0;   // SYS_utime
-        case 280: return 0;   // SYS_utimensat
+        case 268: { // SYS_fchmodat(dirfd=a, path=b, mode=c)
+          let path = readCString(b);
+          if (!path.startsWith('/')) { if ((a|0) !== -100) return -95; path = '/' + path; }
+          path = vfs.resolvePath(path);
+          vfs.metadata.set(path, { ...(vfs.metadata.get(path)||{}), mode: c >>> 0 });
+          return 0;
+        }
+        case 260: { // SYS_fchownat(dirfd=a, path=b, uid=c, gid=d)
+          let path = readCString(b);
+          if (!path.startsWith('/')) { if ((a|0) !== -100) return -95; path = '/' + path; }
+          path = vfs.resolvePath(path);
+          vfs.metadata.set(path, { ...(vfs.metadata.get(path)||{}), uid: c, gid: d });
+          return 0;
+        }
+        case 280: { // SYS_utimensat(dirfd=a, path=b, times=c, flags=d)
+          if (b) {
+            let path = readCString(b);
+            if (!path.startsWith('/')) { if ((a|0) !== -100) return -95; path = '/' + path; }
+            path = vfs.resolvePath(path);
+            if (c) {
+              const v = new DataView(memory.buffer);
+              const atime_sec = Number(v.getBigInt64(c >>> 0, true));
+              const atime_nsec = Number(v.getBigInt64((c >>> 0) + 8, true));
+              const mtime_sec = Number(v.getBigInt64((c >>> 0) + 16, true));
+              const mtime_nsec = Number(v.getBigInt64((c >>> 0) + 24, true));
+              const now = Math.floor(Date.now() / 1000); // UTIME_NOW uses current time
+              const UTIME_NOW = 0x3FFFFFFF, UTIME_OMIT = 0x3FFFFFFE;
+              const existing = vfs.metadata.get(path) || {};
+              const atime = (atime_nsec === UTIME_OMIT) ? existing.atime
+                           : (atime_nsec === UTIME_NOW) ? now : atime_sec;
+              const mtime = (mtime_nsec === UTIME_OMIT) ? existing.mtime
+                           : (mtime_nsec === UTIME_NOW) ? now : mtime_sec;
+              vfs.metadata.set(path, { ...existing, atime, mtime });
+            }
+          }
+          return 0;
+        }
         case 133: return -38; // SYS_mknod → ENOSYS
-        case 137: return 0;   // SYS_statfs → return ENOSYS? Let's try 0
-        case 138: return 0;   // SYS_fstatfs
-        case 191: return 0;   // SYS_getxattr → return 0 (no attrs)
+        case 137: { // SYS_statfs(path=a, buf=b)
+          const buf = b >>> 0;
+          new Uint8Array(memory.buffer, buf, 120).fill(0);
+          const v = new DataView(memory.buffer);
+          // x86-64 struct statfs: all fields are long (8 bytes)
+          v.setBigInt64(buf + 0, 0xEF53n, true);   // f_type = EXT4
+          v.setBigInt64(buf + 8, 4096n, true);      // f_bsize
+          v.setBigInt64(buf + 16, 1000000n, true);  // f_blocks
+          v.setBigInt64(buf + 24, 500000n, true);   // f_bfree
+          v.setBigInt64(buf + 32, 500000n, true);   // f_bavail
+          v.setBigInt64(buf + 40, 100000n, true);   // f_files
+          v.setBigInt64(buf + 48, 50000n, true);    // f_ffree
+          v.setBigInt64(buf + 64, 255n, true);      // f_namelen
+          v.setBigInt64(buf + 72, 4096n, true);     // f_frsize
+          return 0;
+        }
+        case 138: { // SYS_fstatfs(fd=a, buf=b)
+          const buf = b >>> 0;
+          new Uint8Array(memory.buffer, buf, 120).fill(0);
+          const v = new DataView(memory.buffer);
+          v.setBigInt64(buf + 0, 0xEF53n, true);
+          v.setBigInt64(buf + 8, 4096n, true);
+          v.setBigInt64(buf + 16, 1000000n, true);
+          v.setBigInt64(buf + 24, 500000n, true);
+          v.setBigInt64(buf + 32, 500000n, true);
+          v.setBigInt64(buf + 40, 100000n, true);
+          v.setBigInt64(buf + 48, 50000n, true);
+          v.setBigInt64(buf + 64, 255n, true);
+          v.setBigInt64(buf + 72, 4096n, true);
+          return 0;
+        }
+        case 266: { // SYS_symlinkat(target=a, newdirfd=b, linkpath=c)
+          const target = readCString(a);
+          let linkpath = readCString(c);
+          if (!linkpath.startsWith('/')) { if ((b|0) !== -100) return -95; linkpath = '/' + linkpath; }
+          vfs.createSymlink(target, linkpath);
+          return 0;
+        }
+        case 265: { // SYS_linkat(olddirfd=a, oldpath=b, newdirfd=c, newpath=d, flags=e)
+          let oldpath = readCString(b);
+          let newpath = readCString(d);
+          if (!oldpath.startsWith('/')) { if ((a|0) !== -100) return -95; oldpath = '/' + oldpath; }
+          if (!newpath.startsWith('/')) { if ((c|0) !== -100) return -95; newpath = '/' + newpath; }
+          const content = vfs.files.get(vfs.resolvePath(oldpath));
+          if (!content) return -2;
+          vfs.addFile(vfs.resolvePath(newpath), new Uint8Array(content));
+          return 0;
+        }
+        case 40: { // SYS_sendfile(out_fd=a, in_fd=b, offset_ptr=c, count=d)
+          const outFile = vfs.openFiles.get(a);
+          const inFile = vfs.openFiles.get(b);
+          if (!outFile || !inFile) return -9;
+          const count = d >>> 0;
+          const v = new DataView(memory.buffer);
+          const offset = c ? Number(v.getBigInt64(c >>> 0, true)) : (inFile.position || 0);
+          const avail = Math.min(count, (inFile.content?.length || 0) - offset);
+          if (avail <= 0) return 0;
+          vfs.write(a, inFile.content.subarray(offset, offset + avail), outFile.position || 0);
+          outFile.position = (outFile.position || 0) + avail;
+          if (c) v.setBigInt64(c >>> 0, BigInt(offset + avail), true);
+          else inFile.position = offset + avail;
+          return avail;
+        }
+        case 191: return 0;   // SYS_getxattr → 0 (no attrs)
         case 192: return 0;   // SYS_lgetxattr
         case 193: return 0;   // SYS_fgetxattr
-        case 197: return -38; // SYS_removexattr
-        case 198: return -38; // SYS_lremovexattr
-        case 199: return -38; // SYS_fremovexattr
+        case 197: return -61; // SYS_removexattr → ENODATA
+        case 198: return -61; // SYS_lremovexattr
+        case 199: return -61; // SYS_fremovexattr
         case 74: return 0;    // SYS_fsync
         case 75: return 0;    // SYS_fdatasync
         case 76: return 0;    // SYS_truncate
@@ -1186,6 +1447,17 @@ function createImports(args, env, getCwd, setCwd) {
         // UDP loopback — musl's AI_ADDRCONFIG probe. No-op success.
         return 0;
       }
+      // [Phase 5] HTTP fetch bypass: intercept port 80/443 for native browser fetch
+      if (port === 80 || port === 443) {
+        sock.httpIntercept = true;
+        sock.httpBuffer = [];
+        sock.httpPort = port;
+        sock.httpHost = ip;
+        sock.httpResponseBuf = null;
+        sock.httpResponsePos = 0;
+        sock.httpHeadersSent = false;
+        return 0; // connect "succeeds" immediately
+      }
       self.postMessage({ type: 'socket-connect', sockId: id, ip, port });
       // Block until main thread signals connect result
       while (Atomics.load(sock.control, 3) === 0) {
@@ -1200,10 +1472,37 @@ function createImports(args, env, getCwd, setCwd) {
       const sock = sockets.get(id);
       if (!sock) return -1;
       const data = new Uint8Array(memory.buffer, bufPtr, len).slice();
+      // [Phase 5] HTTP fetch bypass: buffer HTTP request, fire native fetch
+      if (sock.httpIntercept) {
+        sock.httpBuffer.push(data);
+        // Check for complete HTTP request (ends with \r\n\r\n)
+        const combined = new Uint8Array(sock.httpBuffer.reduce((a, b) => a + b.length, 0));
+        let off = 0;
+        for (const chunk of sock.httpBuffer) { combined.set(chunk, off); off += chunk.length; }
+        const text = new TextDecoder().decode(combined);
+        const headerEnd = text.indexOf('\r\n\r\n');
+        if (headerEnd !== -1) {
+          const lines = text.substring(0, headerEnd).split('\r\n');
+          const [method, path] = lines[0].split(' ');
+          const headers = {};
+          for (let i = 1; i < lines.length; i++) {
+            const colon = lines[i].indexOf(':');
+            if (colon > 0) headers[lines[i].substring(0, colon).toLowerCase().trim()] = lines[i].substring(colon + 1).trim();
+          }
+          const host = headers['host'] || sock.httpHost;
+          const scheme = sock.httpPort === 443 ? 'https' : 'http';
+          const url = `${scheme}://${host}${path}`;
+          // Fire native browser fetch — bypasses interpreted glibc HTTP + OpenSSL
+          const fetchHeaders = {};
+          for (const [k, v] of Object.entries(headers)) {
+            if (k !== 'host' && k !== 'connection' && k !== 'accept-encoding') fetchHeaders[k] = v;
+          }
+          self.postMessage({ type: 'http-fetch', sockId: id, url, method, headers: fetchHeaders });
+          sock.httpRequestSent = true;
+        }
+        return len;
+      }
       if (sock.isDns || sock.isUdp) {
-        // UDP sends are DNS queries — route to main thread DoH resolver.
-        // musl's resolver may use sendto() without connect(), so isDns
-        // might not be set. All UDP traffic in this runtime is DNS.
         self.postMessage({ type: 'dns-query', sockId: id, data: data.buffer }, [data.buffer]);
       } else {
         self.postMessage({ type: 'socket-send', sockId: id, data: data.buffer }, [data.buffer]);
@@ -1248,19 +1547,52 @@ function createImports(args, env, getCwd, setCwd) {
 
     fork_spawn(statePtr, stateLen) {
       self.postMessage({ type: 'debug', message: 'fork_spawn called, stateLen=' + stateLen });
-      const state = new Uint8Array(memory.buffer, statePtr, stateLen).slice();
       const pid = nextPid++;
 
-      // Serialize VFS files and symlinks for the child
-      const files = {};
-      for (const [path, content] of vfs.files) {
-        files[path] = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
-      }
-      const symlinks = {};
-      if (vfs.symlinks) {
-        for (const [path, target] of vfs.symlinks) {
-          symlinks[path] = target;
+      // SoftMMU fork: copy all host pages to SharedArrayBuffer + full memory as fallback.
+      const hpCount = instance.exports.get_hostpages_count();
+      const hpAddrsPtr = instance.exports.get_hostpages_addrs();
+
+      // Copy each host page (4KB) into SAB[index * 4096].
+      const guestPagesSab = new SharedArrayBuffer(hpCount * 4096 || 4096);
+      const sabView = new Uint8Array(guestPagesSab);
+      const hpAddrs = new Uint32Array(memory.buffer, hpAddrsPtr, hpCount);
+      for (let i = 0; i < hpCount; i++) {
+        const addr = hpAddrs[i];
+        if (addr !== 0) {
+          sabView.set(
+            new Uint8Array(memory.buffer, addr, 4096),
+            i * 4096
+          );
         }
+      }
+
+      // No full memory copy — guest pages fault from SAB via page_pool_fault.
+      // Child uses NewMachine/NewSystem on its own heap.
+
+      // Copy the fork state blob (registers + page table + hostpage offsets, NO page contents)
+      const forkState = new Uint8Array(memory.buffer, statePtr, stateLen).slice();
+
+      // [1h] Serialize full VFS state for child — not just files/symlinks
+      const vfsState = {
+        files: {},
+        dirs: Array.from(vfs.dirs),
+        symlinks: Object.fromEntries(vfs.symlinks),
+        whiteouts: Array.from(vfs.whiteouts),
+        metadata: {},
+        children: {},
+        bootTime: vfs.bootTime,
+      };
+      for (const [path, content] of vfs.files) {
+        if (content && content.buffer) {
+          vfsState.files[path] = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
+        }
+      }
+      for (const [path, meta] of vfs.metadata) {
+        vfsState.metadata[path] = meta;
+      }
+      for (const [path, childSet] of vfs.children) {
+        vfsState.children[path] = Array.from(childSet);
       }
 
       // Create a SharedArrayBuffer flag for wait synchronization
@@ -1273,16 +1605,118 @@ function createImports(args, env, getCwd, setCwd) {
         pipeSabs[id] = pipe.sab;
       }
 
+      // Serialize open HOST file descriptors — the child needs these for demand-paging.
+      // Blink's page pool lazily loads library pages via preadv on HOST fds.
+      const hostOpenFiles = {};
+      for (const [fd, file] of vfs.openFiles) {
+        if (file.isDir || file.special || !file.content) continue; // skip dirs and special files
+        hostOpenFiles[fd] = {
+          path: file.path,
+          content: file.content.buffer.slice(file.content.byteOffset, file.content.byteOffset + file.content.byteLength),
+          position: file.position || 0,
+        };
+      }
+
       // Tell main thread to spawn a child Worker
       self.postMessage({
         type: 'fork',
-        state: state.buffer,
+        guestPagesSab,
+        forkState: forkState.buffer,
+        forkStateLen: stateLen,
+        parentBrk: hostState.brk || memory.buffer.byteLength,
         pid,
-        files,
-        symlinks,
+        vfsState,
+        hostOpenFiles,
         waitFlag,
         pipeSabs,
-      }, [state.buffer]);
+      }, [forkState.buffer]);
+
+      // Store the wait flag so proc_wait can block on it
+      pendingWaits.set(pid, { flag: waitFlagView, exitCode: 0 });
+
+      return pid;
+    },
+
+    fork_exec_spawn(pid, pathPtr, argvPackedPtr, argvLen, envpPackedPtr, envpLen) {
+      /* Phase 2c: fork+exec fast path.
+       * No SerializeForkState, no SAB page copy. Just spawn a child Worker
+       * that runs the specified program from scratch. ~6MB saved per fork+exec. */
+      self.postMessage({ type: 'debug', message: 'fork_exec_spawn: pid=' + pid + ' path=' + readCString(pathPtr) });
+
+      const path = readCString(pathPtr);
+
+      // Unpack null-separated argv
+      const argvBytes = new Uint8Array(memory.buffer, argvPackedPtr, argvLen);
+      const argvList = [];
+      let start = 0;
+      for (let i = 0; i < argvLen; i++) {
+        if (argvBytes[i] === 0) {
+          argvList.push(new TextDecoder().decode(argvBytes.subarray(start, i)));
+          start = i + 1;
+        }
+      }
+
+      // Unpack null-separated envp
+      const envpBytes = new Uint8Array(memory.buffer, envpPackedPtr, envpLen);
+      const envpList = [];
+      start = 0;
+      for (let i = 0; i < envpLen; i++) {
+        if (envpBytes[i] === 0) {
+          envpList.push(new TextDecoder().decode(envpBytes.subarray(start, i)));
+          start = i + 1;
+        }
+      }
+
+      // Convert envp list to env object
+      const env = {};
+      for (const entry of envpList) {
+        const eq = entry.indexOf('=');
+        if (eq > 0) env[entry.substring(0, eq)] = entry.substring(eq + 1);
+      }
+
+      // Serialize VFS state for child (same as fork_spawn)
+      const vfsState = {
+        files: {},
+        dirs: Array.from(vfs.dirs),
+        symlinks: Object.fromEntries(vfs.symlinks),
+        whiteouts: Array.from(vfs.whiteouts),
+        metadata: {},
+        children: {},
+        bootTime: vfs.bootTime,
+      };
+      for (const [p, content] of vfs.files) {
+        if (content && content.buffer) {
+          vfsState.files[p] = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
+        }
+      }
+      for (const [p, meta] of vfs.metadata) {
+        vfsState.metadata[p] = meta;
+      }
+      for (const [p, childSet] of vfs.children) {
+        vfsState.children[p] = Array.from(childSet);
+      }
+
+      // Create wait flag for proc_wait synchronization
+      const waitFlag = new SharedArrayBuffer(8);
+      const waitFlagView = new Int32Array(waitFlag);
+
+      // Serialize pipe SABs for the child
+      const pipeSabs = {};
+      for (const [id, pipe] of pipes) {
+        pipeSabs[id] = pipe.sab;
+      }
+
+      // Tell main thread to spawn a child Worker that runs the program directly
+      self.postMessage({
+        type: 'fork-exec',
+        pid,
+        path,
+        argv: argvList,
+        env,
+        vfsState,
+        waitFlag,
+        pipeSabs,
+      });
 
       // Store the wait flag so proc_wait can block on it
       pendingWaits.set(pid, { flag: waitFlagView, exitCode: 0 });
@@ -1291,8 +1725,27 @@ function createImports(args, env, getCwd, setCwd) {
     },
 
     proc_wait(pid, statusPtr) {
-      const waiter = pendingWaits.get(pid);
-      if (!waiter) return -1;
+      let waiter, waitPid;
+
+      if (pid === -1 || pid === 0) {
+        // Wait for ANY child — check if any already exited, else wait on first
+        for (const [p, w] of pendingWaits) {
+          if (Atomics.load(w.flag, 0) !== 0) {
+            waiter = w; waitPid = p; break; // already exited
+          }
+        }
+        if (!waiter) {
+          // No child exited yet — wait on the first pending one
+          const first = pendingWaits.entries().next();
+          if (first.done) return -10; // ECHILD
+          [waitPid, waiter] = first.value;
+        }
+      } else {
+        waiter = pendingWaits.get(pid);
+        waitPid = pid;
+      }
+
+      if (!waiter) return -10; // ECHILD
 
       // Block until child sets the flag
       if (Atomics.load(waiter.flag, 0) === 0) {
@@ -1305,8 +1758,8 @@ function createImports(args, env, getCwd, setCwd) {
         new DataView(memory.buffer).setInt32(statusPtr, exitCode, true);
       }
 
-      pendingWaits.delete(pid);
-      return pid;
+      pendingWaits.delete(waitPid);
+      return waitPid;
     },
   };
 }

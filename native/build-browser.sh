@@ -75,6 +75,7 @@ ${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding \
 # Provide _start (crt1) — calls musl's __libc_start_main
 cat > "${BUILD_DIR}/crt1.c" << 'EOF'
 extern int main(int, char **);
+extern void __wasm_call_ctors(void);
 
 /* Get args from JS via atua imports */
 __attribute__((import_module("atua"), import_name("args_sizes_get")))
@@ -82,13 +83,15 @@ extern int _args_sizes_get(int *argc, int *argv_buf_size);
 __attribute__((import_module("atua"), import_name("args_get")))
 extern int _args_get(char **argv, char *argv_buf);
 
+/* Normal entry: init C runtime + run main */
 __attribute__((export_name("_start")))
 void _start(void) {
+    __wasm_call_ctors();
+
     int argc = 0, argv_buf_size = 0;
     _args_sizes_get(&argc, &argv_buf_size);
 
-    /* Allocate argv array and buffer on the stack */
-    char *argv_buf[4096];  /* enough for any reasonable args */
+    char *argv_buf[4096];
     char argv_data[8192];
     char **argv = (char **)argv_buf;
     _args_get(argv, (char *)argv_data);
@@ -96,6 +99,14 @@ void _start(void) {
 
     main(argc, argv);
     __builtin_trap();
+}
+
+/* Fork child entry: init C runtime WITHOUT main.
+ * Child gets a fresh WASM instance with uninitialized musl.
+ * This makes malloc/brk/TLS work before restore_fork runs. */
+__attribute__((export_name("init_for_fork")))
+void init_for_fork(void) {
+    __wasm_call_ctors();
 }
 EOF
 ${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding \
@@ -118,7 +129,8 @@ ${WASI_SDK}/bin/wasm-ld \
     ${MUSL}/lib/libc.a \
     ${RT} \
     -z stack-size=1048576 \
-    --export-memory --export=_start --export=restore_fork --export=malloc --export=free --export=get_exit_code \
+    --export-memory --export=_start --export=init_for_fork --export=restore_fork --export=malloc --export=free --export=get_exit_code \
+    --export=get_pagepool_base --export=get_pagepool_size --export=get_hostpages_count --export=get_hostpages_addrs \
     -o "${OUTPUT}"
 
 echo "=== Result ==="

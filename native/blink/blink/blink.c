@@ -399,15 +399,22 @@ void exit(int status) {
 // Export: called by Web Worker to restore fork state
 __attribute__((export_name("restore_fork")))
 void restore_fork(uint8_t *state_buf, int state_len) {
-  extern int DeserializeForkState(struct Machine *, const uint8_t *, size_t);
+  extern void RestoreForkCpuState(struct Machine *, const uint8_t *, size_t);
   extern void ResetTlb(struct Machine *);
+  extern void InitPagePool(size_t);
+  /* Option 2: NewMachine/NewSystem on child's own fresh heap.
+   * RestoreForkCpuState writes only CPU registers into the new Machine.
+   * Guest pages come from SAB via page_pool_fault — no full memory copy.
+   * All allocations here are on the child's own heap — safe. */
   InitMap();
+  InitPagePool(2048);
+  InitBus();
   struct Machine *fm = NewMachine(NewSystem(XED_MACHINE_MODE_LONG), 0);
   {
     int fi;
     for (fi = 0; fi < 10; ++fi) AddStdFd(&fm->system->fds, fi);
   }
-  DeserializeForkState(fm, state_buf, state_len);
+  RestoreForkCpuState(fm, state_buf, state_len);
   ResetTlb(fm);
   __builtin_memset(fm->opcache, 0, sizeof(*fm->opcache));
   fm->system->exec = Exec;

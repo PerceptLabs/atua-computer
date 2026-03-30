@@ -438,6 +438,13 @@ struct Machine {               //
   bool traprdtsc;                        //
   bool trapcpuid;                        //
   bool boop;                             //
+#ifdef __ATUA_BROWSER__
+  bool vfork_exec_pending;              // fork+exec fast path: child runs in parent
+  int vfork_child_pid;                   // pid assigned to the vfork child
+  u64 vfork_saved_ip;                    // parent IP saved at fork point
+  u8 vfork_saved_regs[128];             // parent general registers saved at fork
+  /* Reserved for future fd ops log (Phase 2c+) */
+#endif
   i8 trapno;                             //
   i8 segvcode;                           //
   struct MachineTlb tlb[32];             //
@@ -842,7 +849,15 @@ static inline u8 *FindHostPage(u64 entry) {
   if (HasLinearMapping()) {
     return (u8 *)(uintptr_t)(entry & PAGE_TA);
   } else {
-    return g_hostpages.p[(entry & PAGE_TA) >> 12];
+    size_t idx = (entry & PAGE_TA) >> 12;
+    u8 *page = g_hostpages.p[idx];
+#ifdef __ATUA_BROWSER__
+    if (!page) {
+      extern u8 *FaultHostPageFromSab(size_t);
+      page = FaultHostPageFromSab(idx);
+    }
+#endif
+    return page;
   }
 }
 

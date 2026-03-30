@@ -314,12 +314,16 @@ ssize_t VfsPathBuild(struct VfsInfo *, struct VfsInfo *, bool,
 #ifdef __ATUA_BROWSER__
 extern __attribute__((import_module("atua"), import_name("fs_fstat"))) long long atua_fs_fstat_fn(int);
 static inline int _atua_vfs_fstat(int fd, struct stat *st) {
-    long long size = atua_fs_fstat_fn(fd);
-    if (size < 0) return -1;
+    long long val = atua_fs_fstat_fn(fd);
+    if (val < 0) return -1;
     __builtin_memset(st, 0, sizeof(*st));
+    /* Encoding: low 16 bits = mode, upper bits = size << 16.
+     * mode 0 means default (regular file 0100755). */
+    unsigned mode = (unsigned)val & 0xFFFF;
+    long long size = (val >> 16) & 0x7FFFFFFFFFFFFFFFLL;
     st->st_size = size;
-    st->st_mode = 0100755; /* regular file */
-    st->st_nlink = 1;
+    st->st_mode = mode ? mode : 0100755;
+    st->st_nlink = ((mode & 0170000) == 040000) ? 2 : 1;
     return 0;
 }
 #define VfsFstat(fd, st) _atua_vfs_fstat(fd, st)
@@ -431,14 +435,16 @@ static inline int _atua_vfs_open(int dirfd, const char *path, int flags, int mod
 #ifdef __ATUA_BROWSER__
 extern __attribute__((import_module("atua"), import_name("fs_fstat"))) long long atua_fs_fstat_fn2(int);
 static inline int _atua_vfs_fstat2(int fd, struct stat *st) {
-    long long size = atua_fs_fstat_fn2(fd);
-    if (size < 0) return -1;
+    long long val = atua_fs_fstat_fn2(fd);
+    if (val < 0) return -1;
     __builtin_memset(st, 0, sizeof(*st));
+    unsigned mode = (unsigned)val & 0xFFFF;
+    long long size = (val >> 16) & 0x7FFFFFFFFFFFFFFFLL;
     st->st_size = size;
-    st->st_mode = 0100755;
-    st->st_nlink = 1;
+    st->st_mode = mode ? mode : 0100755;
+    st->st_nlink = ((mode & 0170000) == 040000) ? 2 : 1;
     st->st_dev = 1;
-    st->st_ino = fd + 1000;  /* unique per fd */
+    st->st_ino = fd + 1000;
     return 0;
 }
 #define VfsFstat(fd, st) _atua_vfs_fstat2(fd, st)

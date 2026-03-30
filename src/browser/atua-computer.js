@@ -16,6 +16,8 @@ export class AtuaComputer {
     this._socketSabs = new Map(); // sockId → { sab, control, data, streamId }
     this._dnsProxyUrl = null;
     this._dnsCache = new Map(); // ip → hostname (reverse map from DNS resolution)
+    // Phase 2e: Worker pool — pre-spawned Workers for fork children
+    this._workerPool = [];
     // Create stdin SharedArrayBuffer eagerly so writeStdin can be called before boot completes
     this._stdinSab = new SharedArrayBuffer(4096 + 16);
     this._stdinControl = new Int32Array(this._stdinSab, 0, 4);
@@ -27,10 +29,12 @@ export class AtuaComputer {
       console.log(new TextDecoder().decode(bytes));
     });
 
-    // Load engine WASM
-    this._engineWasm = typeof opts.engineUrl === 'string'
+    // Load engine WASM and pre-compile module (shared across all fork children)
+    const engineBytes = typeof opts.engineUrl === 'string'
       ? await fetch(opts.engineUrl).then(r => r.arrayBuffer())
       : (opts.engineUrl instanceof ArrayBuffer ? opts.engineUrl : opts.engineUrl.buffer.slice(opts.engineUrl.byteOffset, opts.engineUrl.byteOffset + opts.engineUrl.byteLength));
+    this._engineWasm = engineBytes;
+    this._engineModule = await WebAssembly.compile(engineBytes);
 
     // Load rootfs tar
     let rootfsTar = null;
@@ -61,6 +65,11 @@ export class AtuaComputer {
       console.log('Wisp relay connected');
     }
     this._dnsProxyUrl = opts.dnsProxyUrl || null;
+
+    // Phase 2e: Pre-spawn 4 Workers into the pool for fork children
+    for (let i = 0; i < 4; i++) {
+      this._workerPool.push(new Worker('/engine-worker.js'));
+    }
 
     // Create engine Worker
     this._worker = new Worker('/engine-main-worker.js', { type: 'module' });
@@ -105,6 +114,8 @@ export class AtuaComputer {
       console.error('Engine error:', msg.message);
     } else if (msg.type === 'fork') {
       this._spawnChildWorker(msg);
+    } else if (msg.type === 'fork-exec') {
+      this._spawnForkExecWorker(msg);
     } else if (msg.type === 'debug') {
       console.log('[Worker]', msg.message);
     } else if (msg.type === 'socket-open') {
@@ -117,6 +128,8 @@ export class AtuaComputer {
       this._handleSocketClose(msg);
     } else if (msg.type === 'dns-query') {
       this._handleDnsQuery(msg);
+    } else if (msg.type === 'http-fetch') {
+      this._handleHttpFetch(msg);
     }
   }
 
@@ -134,9 +147,12 @@ export class AtuaComputer {
   }
 
   _spawnChildWorker(msg) {
-    const { state, pid, files, symlinks, waitFlag, pipeSabs } = msg;
+    const { guestPagesSab, forkState, forkStateLen, parentBrk, pid, vfsState, hostOpenFiles, waitFlag, pipeSabs } = msg;
 
-    const child = new Worker('/engine-worker.js');
+    // Phase 2e: Grab a Worker from the pool, or create one if pool is empty
+    const child = this._workerPool.length > 0
+      ? this._workerPool.pop()
+      : new Worker('/engine-worker.js');
     this._children.set(pid, child);
 
     child.onmessage = (ce) => {
@@ -154,6 +170,10 @@ export class AtuaComputer {
           Atomics.notify(view, 0);
         }
         this._children.delete(pid);
+        // Phase 2e: Reset and return Worker to pool for reuse
+        this._recycleWorker(child);
+      } else if (ce.data.type === 'reset-ack') {
+        // Worker confirmed reset — already back in pool, ready for reuse
       }
     };
 
@@ -163,13 +183,114 @@ export class AtuaComputer {
 
     child.postMessage({
       type: 'restore-fork',
-      state,
+      guestPagesSab,
+      forkState,
+      forkStateLen,
+      parentBrk,
       pid,
-      engineUrl: '/engine.wasm',
-      files,
-      symlinks: symlinks || {},
+      engineModule: this._engineModule,
+      vfsState: vfsState || {},
+      hostOpenFiles: hostOpenFiles || {},
       pipeSabs: pipeSabs || {},
     });
+  }
+
+  /** Phase 2c: fork+exec fast path — spawn a child Worker that runs the
+   *  program directly without restoring fork state or copying guest pages.
+   *  Saves ~6MB per fork+exec (8.8KB fork blob + 5.8MB SAB page copy). */
+  _spawnForkExecWorker(msg) {
+    const { pid, path, argv, env, vfsState, waitFlag, pipeSabs } = msg;
+
+    const child = this._workerPool.length > 0
+      ? this._workerPool.pop()
+      : new Worker('/engine-worker.js');
+    this._children.set(pid, child);
+
+    child.onmessage = (ce) => {
+      if (ce.data.type === 'stdout') {
+        this.outputCallback(ce.data.data);
+      } else if (ce.data.type === 'exit') {
+        this._worker.postMessage({ type: 'child-exit', pid: ce.data.pid, code: ce.data.code });
+        if (waitFlag) {
+          const view = new Int32Array(waitFlag);
+          Atomics.store(view, 1, ce.data.code || 0);
+          Atomics.store(view, 0, 1);
+          Atomics.notify(view, 0);
+        }
+        this._children.delete(pid);
+        this._recycleWorker(child);
+      } else if (ce.data.type === 'reset-ack') {
+        // Worker confirmed reset
+      }
+    };
+
+    child.onerror = (err) => {
+      console.error('Fork-exec child Worker error:', err.message);
+    };
+
+    child.postMessage({
+      type: 'fork-exec',
+      pid,
+      path,
+      argv,
+      env,
+      engineModule: this._engineModule,
+      vfsState: vfsState || {},
+      pipeSabs: pipeSabs || {},
+    });
+  }
+
+  /** Phase 2e: Send reset message to Worker and return it to the pool */
+  _recycleWorker(worker) {
+    worker.postMessage({ type: 'reset' });
+    this._workerPool.push(worker);
+  }
+
+  /* --- HTTP Fetch Bypass (Phase 5) --- */
+
+  async _handleHttpFetch(msg) {
+    const { sockId, url, method, headers } = msg;
+    const sabInfo = this._socketSabs.get(sockId);
+    if (!sabInfo) return;
+    try {
+      const response = await fetch(url, { method, headers });
+      // Synthesize HTTP response headers
+      const statusLine = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
+      const respHeaders = [];
+      response.headers.forEach((v, k) => { respHeaders.push(`${k}: ${v}`); });
+      const headerStr = statusLine + respHeaders.join('\r\n') + '\r\n\r\n';
+      const headerBytes = new TextEncoder().encode(headerStr);
+      // Stream: write headers + body into socket SAB
+      const body = await response.arrayBuffer();
+      const bodyBytes = new Uint8Array(body);
+      const fullResponse = new Uint8Array(headerBytes.length + bodyBytes.length);
+      fullResponse.set(headerBytes);
+      fullResponse.set(bodyBytes, headerBytes.length);
+      // Write to socket SAB in chunks
+      const data = new Uint8Array(sabInfo.sab, 32, sabInfo.sab.byteLength - 32);
+      const control = new Int32Array(sabInfo.sab, 0, 8);
+      let written = 0;
+      while (written < fullResponse.length) {
+        const wp = Atomics.load(control, 0);
+        const rp = Atomics.load(control, 1);
+        const bufSize = data.length;
+        const available = bufSize - ((wp - rp + bufSize) % bufSize) - 1;
+        if (available <= 0) {
+          await new Promise(r => setTimeout(r, 1));
+          continue;
+        }
+        const chunk = Math.min(available, fullResponse.length - written);
+        for (let i = 0; i < chunk; i++) {
+          data[(wp + i) % bufSize] = fullResponse[written + i];
+        }
+        Atomics.store(control, 0, wp + chunk);
+        Atomics.notify(control, 1);
+        written += chunk;
+      }
+    } catch (err) {
+      console.error('HTTP fetch bypass error:', err.message, 'url:', url);
+      // Fall through — socket read will return 0 (EOF)
+    }
   }
 
   /* --- Socket message handlers --- */

@@ -100,7 +100,7 @@ test('apt update + apt install curl + curl example.com', async ({ page }) => {
   try {
     await page.waitForFunction(() => {
       const text = document.getElementById('output')?.textContent || '';
-      return text.includes('[Tests complete]') || text.includes('[ALL PASS]') ||
+      return text.includes('[Tests complete]') || text.includes('STEP3-OK') ||
              text.includes('[FAIL]') || text.includes('ERROR:');
     }, { timeout: 280000 });
   } catch (e) {
@@ -116,5 +116,5 @@ test('apt update + apt install curl + curl example.com', async ({ page }) => {
   console.log(pageText.slice(-2000));
 
   // Check each step
-  expect(pageText).toContain('[STEP 1 PASS]');
+  expect(pageText).toContain('STEP1-OK');
 });
