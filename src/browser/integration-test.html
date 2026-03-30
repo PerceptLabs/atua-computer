@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — integration test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — integration test</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg) { output.textContent += msg; }
+
+    const params = new URLSearchParams(location.search);
+    const relayUrl = params.get('relay');
+    const dnsProxy = params.get('dns');
+    const script = params.get('script') || 'echo hello';
+
+    try {
+      const computer = new AtuaComputer();
+      log('Booting...\n');
+
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-rootfs.tar',
+        args: ['engine', '/bin/bash', '--norc', '--noprofile', '-c', script],
+        env: { HOME: '/', TERM: 'dumb', PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+               DEBIAN_FRONTEND: 'noninteractive', LC_ALL: 'C' },
+        files: {
+          '/etc/resolv.conf': new TextEncoder().encode('nameserver 8.8.8.8\n'),
+          '/etc/apt/sources.list': new TextEncoder().encode(
+            'deb http://deb.debian.org/debian trixie main\n'
+          ),
+          '/var/lib/apt/lists/.keep': new Uint8Array(0),
+          '/var/lib/apt/lists/partial/.keep': new Uint8Array(0),
+          '/var/cache/apt/archives/partial/.keep': new Uint8Array(0),
+          '/var/lib/dpkg/updates/.keep': new Uint8Array(0),
+          '/var/lib/dpkg/info/.keep': new Uint8Array(0),
+          '/etc/apt/apt.conf.d/.keep': new Uint8Array(0),
+          '/etc/apt/sources.list.d/.keep': new Uint8Array(0),
+          '/etc/apt/preferences.d/.keep': new Uint8Array(0),
+          '/tmp/.keep': new Uint8Array(0),
+          '/var/log/.keep': new Uint8Array(0),
+          '/run/lock/.keep': new Uint8Array(0),
+        },
+        wispRelayUrl: relayUrl || undefined,
+        dnsProxyUrl: dnsProxy || undefined,
+        onOutput: (bytes) => {
+          log(new TextDecoder().decode(bytes));
+        },
+      });
+
+      log('\n[DONE]\n');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('\n[DONE]\n');
+      } else {
+        log('\nERROR: ' + err.message + '\n');
+      }
+    }
+  </script>
+</body>
+</html>

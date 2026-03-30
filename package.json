@@ -1,0 +1,28 @@
+{
+  "name": "atua-computer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "validate:phase-b": "node scripts/phase-b-validation.js",
+    "tracker:update": "node scripts/update-progress-tracker.js",
+    "validate:phase-c": "node scripts/phase-c-validation.js",
+    "report:syscalls": "node scripts/syscall-gap-report.js",
+    "validate:phase-d": "node scripts/phase-d-validation.js",
+    "validate:stability": "node scripts/stability-runs.js",
+    "validate:phase-e": "node scripts/phase-e-validation.js",
+    "validate:phase-f": "node scripts/phase-f-validation.js",
+    "validate:release": "node scripts/release-readiness-check.js",
+    "validate:phase-f2": "node scripts/phase-f2-production-parity.js"
+  },
+  "dependencies": {
+    "@wasmer/sdk": "^0.10.0",
+    "opfs-tools": "^0.7.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "playwright": "^1.58.2",
+    "ws": "^8.20.0"
+  }
+}

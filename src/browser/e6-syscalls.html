@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — syscall tests</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+    .info { color: #a8d8ea; } .success { color: #4ecca3; } .error { color: #e84545; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — syscall test suite</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg, cls = '') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = msg;
+      output.appendChild(span);
+    }
+
+    try {
+      const computer = new AtuaComputer();
+      log('Running syscall test suite...\n', 'info');
+
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-mini.tar',
+        args: ['engine', '/test_syscalls'],
+        env: { HOME: '/' },
+        onOutput: (bytes) => {
+          const text = new TextDecoder().decode(bytes);
+          // Color PASS green and FAIL red
+          if (text.includes('PASS')) log(text, 'success');
+          else if (text.includes('FAIL')) log(text, 'error');
+          else log(text, 'info');
+        },
+      });
+
+      log('\n[Tests complete]\n', 'info');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('\n[Tests complete]\n', 'info');
+      } else {
+        log('\nERROR: ' + err.message + '\n', 'error');
+      }
+    }
+  </script>
+</body>
+</html>

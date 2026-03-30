@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — apt install test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — apt install integration test</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg) {
+      output.textContent += msg;
+    }
+
+    const params = new URLSearchParams(location.search);
+    const relayUrl = params.get('relay');
+    const dnsProxy = params.get('dns');
+    const echoPort = params.get('echoPort') || '80';
+    const binary = params.get('bin') || '/bin/bash';
+    const defaultScript = 'R=OK; echo STEP1-$R; apt --version; echo STEP2-$R';
+    const extraArgs = params.get('args') ? params.get('args').split(',') :
+      ['--norc', '--noprofile', '-c', defaultScript];
+
+    try {
+      const computer = new AtuaComputer();
+      log('Booting engine with networking...\n');
+      log('Relay: ' + (relayUrl || 'none') + '\n');
+      log('Binary: ' + binary + ' ' + extraArgs.join(' ') + '\n');
+
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-rootfs.tar',
+        args: ['engine', binary, ...extraArgs],
+        env: { HOME: '/', TERM: 'dumb', PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+               DEBIAN_FRONTEND: 'noninteractive' },
+        files: {
+          '/etc/resolv.conf': new TextEncoder().encode('nameserver 8.8.8.8\n'),
+          '/etc/apt/sources.list': new TextEncoder().encode(
+            'deb http://deb.debian.org/debian trixie main\n'
+          ),
+          // Required directories for apt/dpkg (VFS.addFile registers parents)
+          '/var/lib/apt/lists/.keep': new Uint8Array(0),
+          '/var/lib/apt/lists/partial/.keep': new Uint8Array(0),
+          '/var/cache/apt/archives/partial/.keep': new Uint8Array(0),
+          '/var/lib/dpkg/updates/.keep': new Uint8Array(0),
+          '/var/lib/dpkg/info/.keep': new Uint8Array(0),
+          '/etc/apt/apt.conf.d/.keep': new Uint8Array(0),
+          '/etc/apt/sources.list.d/.keep': new Uint8Array(0),
+          '/etc/apt/preferences.d/.keep': new Uint8Array(0),
+          '/tmp/.keep': new Uint8Array(0),
+          '/var/log/.keep': new Uint8Array(0),
+          '/run/lock/.keep': new Uint8Array(0),
+        },
+        wispRelayUrl: relayUrl || undefined,
+        dnsProxyUrl: dnsProxy || undefined,
+        onOutput: (bytes) => {
+          log(new TextDecoder().decode(bytes));
+        },
+      });
+
+      log('\n[Tests complete]\n');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('\n[Tests complete]\n');
+      } else {
+        log('\nERROR: ' + err.message + '\n');
+      }
+    }
+  </script>
+</body>
+</html>

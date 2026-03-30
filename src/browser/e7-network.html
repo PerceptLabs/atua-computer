@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-computer — network test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e6e6e6; padding: 20px; }
+    #output { white-space: pre-wrap; background: #16213e; padding: 15px; border-radius: 5px; min-height: 200px; }
+  </style>
+</head>
+<body>
+  <h1>atua-computer — network test (Phase F)</h1>
+  <div id="output"></div>
+
+  <script type="module">
+    import { AtuaComputer } from './atua-computer.js';
+
+    const output = document.getElementById('output');
+    function log(msg) {
+      output.textContent += msg;
+    }
+
+    // Read relay URL from query params: ?relay=ws://localhost:8081
+    const params = new URLSearchParams(location.search);
+    const relayUrl = params.get('relay');
+    const dnsProxy = params.get('dns');
+    const echoPort = params.get('echoPort') || '80';
+    const binary = params.get('bin') || '/test_http_get';
+    const extraArgs = params.get('args') ? params.get('args').split(',') : ['127.0.0.1', echoPort, '/', 'localhost'];
+
+    try {
+      const computer = new AtuaComputer();
+      log('Booting engine with networking...\n');
+      log('Relay: ' + (relayUrl || 'none') + '\n');
+      log('Binary: ' + binary + ' ' + extraArgs.join(' ') + '\n');
+
+      await computer.boot({
+        engineUrl: '/engine.wasm',
+        rootfsUrl: '/debian-mini.tar',
+        args: ['engine', binary, ...extraArgs],
+        env: { HOME: '/' },
+        files: {
+          '/etc/resolv.conf': new TextEncoder().encode('nameserver 1.1.1.1\n'),
+          '/etc/hosts': new TextEncoder().encode('127.0.0.1 localhost\n104.18.27.120 example.com\n'),
+        },
+        wispRelayUrl: relayUrl || undefined,
+        dnsProxyUrl: dnsProxy || undefined,
+        onOutput: (bytes) => {
+          log(new TextDecoder().decode(bytes));
+        },
+      });
+
+      log('\n[Tests complete]\n');
+    } catch (err) {
+      if (err.message?.includes?.('unreachable')) {
+        log('\n[Tests complete]\n');
+      } else {
+        log('\nERROR: ' + err.message + '\n');
+      }
+    }
+  </script>
+</body>
+</html>
