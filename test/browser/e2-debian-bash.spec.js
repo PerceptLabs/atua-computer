@@ -36,6 +36,8 @@ test.beforeAll(async () => {
       '/debian-mini.tar': join(ROOT, 'test/fixtures/debian-mini.tar'),
       '/engine-worker.js': join(BROWSER_DIR, 'engine-worker.js'),
       '/engine-main-worker.js': join(BROWSER_DIR, 'engine-main-worker.js'),
+      '/kernel-worker.js': join(BROWSER_DIR, 'kernel-worker.js'),
+      '/execution-worker.js': join(BROWSER_DIR, 'execution-worker.js'),
     };
     const filePath = fileMap[req.url] || join(BROWSER_DIR, req.url);
     const ext = extname(filePath);

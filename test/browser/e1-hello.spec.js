@@ -32,6 +32,8 @@ const FILE_MAP = {
   '/hello.elf': join(ROOT, 'test/fixtures/hello.elf'),
   '/engine-worker.js': join(BROWSER_DIR, 'engine-worker.js'),
   '/engine-main-worker.js': join(BROWSER_DIR, 'engine-main-worker.js'),
+  '/kernel-worker.js': join(BROWSER_DIR, 'kernel-worker.js'),
+  '/execution-worker.js': join(BROWSER_DIR, 'execution-worker.js'),
 };
 
 let server;

@@ -34,6 +34,8 @@ test.beforeAll(async () => {
       '/filesystem.js': join(BROWSER_DIR, 'filesystem.js'),
       '/engine-worker.js': join(BROWSER_DIR, 'engine-worker.js'),
       '/engine-main-worker.js': join(BROWSER_DIR, 'engine-main-worker.js'),
+      '/kernel-worker.js': join(BROWSER_DIR, 'kernel-worker.js'),
+      '/execution-worker.js': join(BROWSER_DIR, 'execution-worker.js'),
       '/debian-mini.tar': join(ROOT, 'test/fixtures/debian-mini.tar'),
     };
     const filePath = map[pathname] || join(BROWSER_DIR, pathname);

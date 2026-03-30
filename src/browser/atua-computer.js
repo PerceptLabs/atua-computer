@@ -1,23 +1,35 @@
 /**
- * atua-computer browser host layer.
- * Runs the Blink engine on a Web Worker thread.
- * Main thread handles DOM/terminal. Worker runs WASM with Atomics.wait for blocking.
+ * atua-computer browser host layer — kernel architecture.
+ *
+ * Main thread orchestrates:
+ *   - Kernel Worker (kernel-worker.js, module) — handles syscalls via SABs
+ *   - Execution Workers (execution-worker.js, classic) — run Blink WASM engine
+ *
+ * Each execution worker gets a controlSab (256 bytes), dataSab (1MB),
+ * and a shared wakeChannel (4 bytes). The kernel worker receives all SABs
+ * and processes syscalls for every execution worker.
+ *
+ * Wisp relay stays on main thread — kernel sends socket data requests
+ * via postMessage to main thread.
  */
 
 export class AtuaComputer {
   constructor() {
     this.outputCallback = null;
-    this._worker = null;
-    this._children = new Map(); // pid → child Worker
+    this._kernelWorker = null;
+    this._executionWorkers = new Map(); // pid -> execution Worker
     this._exitResolve = null;
     this._engineWasm = null;
+    this._engineModule = null;
     this._files = null;
     this._wisp = null;
-    this._socketSabs = new Map(); // sockId → { sab, control, data, streamId }
+    this._socketSabs = new Map(); // sockId -> { sab, control, data, streamId }
     this._dnsProxyUrl = null;
-    this._dnsCache = new Map(); // ip → hostname (reverse map from DNS resolution)
-    // Phase 2e: Worker pool — pre-spawned Workers for fork children
+    this._dnsCache = new Map(); // ip -> hostname (reverse map from DNS resolution)
+    // Worker pool — pre-spawned execution workers for fork children
     this._workerPool = [];
+    // Shared wake channel for Atomics.notify between kernel and execution workers
+    this._wakeChannel = new SharedArrayBuffer(4);
     // Create stdin SharedArrayBuffer eagerly so writeStdin can be called before boot completes
     this._stdinSab = new SharedArrayBuffer(4096 + 16);
     this._stdinControl = new Int32Array(this._stdinSab, 0, 4);
@@ -29,7 +41,7 @@ export class AtuaComputer {
       console.log(new TextDecoder().decode(bytes));
     });
 
-    // Load engine WASM and pre-compile module (shared across all fork children)
+    // Load engine WASM and pre-compile module (shared across all execution workers)
     const engineBytes = typeof opts.engineUrl === 'string'
       ? await fetch(opts.engineUrl).then(r => r.arrayBuffer())
       : (opts.engineUrl instanceof ArrayBuffer ? opts.engineUrl : opts.engineUrl.buffer.slice(opts.engineUrl.byteOffset, opts.engineUrl.byteOffset + opts.engineUrl.byteLength));
@@ -66,58 +78,107 @@ export class AtuaComputer {
     }
     this._dnsProxyUrl = opts.dnsProxyUrl || null;
 
-    // Phase 2e: Pre-spawn 4 Workers into the pool for fork children
+    // Create Kernel Worker (module worker — handles syscalls)
+    this._kernelWorker = new Worker('/kernel-worker.js', { type: 'module' });
+    this._kernelWorker.onmessage = (e) => this._handleKernelMessage(e);
+    this._kernelWorker.onerror = (e) => {
+      console.error('Kernel worker error:', e.message);
+    };
+
+    // Send init message to kernel with rootfs and files
+    this._kernelWorker.postMessage({
+      type: 'init',
+      rootfsTar,
+      files,
+      stdinSab: this._stdinSab,
+    });
+
+    // Pre-spawn 4 execution workers into the pool for fork children
     for (let i = 0; i < 4; i++) {
-      this._workerPool.push(new Worker('/engine-worker.js'));
+      this._workerPool.push(new Worker('/execution-worker.js'));
     }
 
-    // Create engine Worker
-    this._worker = new Worker('/engine-main-worker.js', { type: 'module' });
+    // Allocate SABs for PID 1
+    const pid1ControlSab = new SharedArrayBuffer(256);
+    const pid1DataSab = new SharedArrayBuffer(1024 * 1024); // 1MB
+
+    // Create execution worker for PID 1
+    const pid1Worker = this._workerPool.length > 0
+      ? this._workerPool.pop()
+      : new Worker('/execution-worker.js');
+    this._executionWorkers.set(1, pid1Worker);
+
+    // Build args — inject strace/statistics flags if requested
+    let args = opts.args || ['engine'];
+    if (opts.syscallTrace) {
+      const level = typeof opts.syscallTrace === 'number' ? opts.syscallTrace : 1;
+      const sFlag = '-' + 's'.repeat(Math.min(level, 4));
+      args = [args[0], sFlag, ...args.slice(1)];
+    }
+    if (opts.statistics) {
+      args = [args[0], '-Z', ...args.slice(1)];
+    }
 
     return new Promise((resolve, reject) => {
       this._exitResolve = resolve;
 
-      this._worker.onmessage = (e) => this._handleWorkerMessage(e, resolve);
-      this._worker.onerror = (e) => reject(new Error('Worker error: ' + e.message));
+      pid1Worker.onmessage = (e) => this._handleExecutionWorkerMessage(e, 1, resolve);
+      pid1Worker.onerror = (e) => reject(new Error('PID 1 worker error: ' + e.message));
 
-      // Build args — inject strace/statistics flags if requested
-      let args = opts.args || ['engine'];
-      if (opts.syscallTrace) {
-        const level = typeof opts.syscallTrace === 'number' ? opts.syscallTrace : 1;
-        const sFlag = '-' + 's'.repeat(Math.min(level, 4));
-        args = [args[0], sFlag, ...args.slice(1)];
-      }
-      if (opts.statistics) {
-        args = [args[0], '-Z', ...args.slice(1)];
-      }
+      // Register PID 1's SABs with kernel
+      this._kernelWorker.postMessage({
+        type: 'register-worker',
+        pid: 1,
+        controlSab: pid1ControlSab,
+        dataSab: pid1DataSab,
+      });
 
-      // Boot the engine on the Worker
-      this._worker.postMessage({
+      // Boot PID 1 execution worker
+      pid1Worker.postMessage({
         type: 'boot',
-        engineWasm: this._engineWasm,
-        rootfsTar,
+        controlSab: pid1ControlSab,
+        dataSab: pid1DataSab,
+        wakeChannel: this._wakeChannel,
+        pid: 1,
+        engineModule: this._engineModule,
         args,
         env: opts.env || {},
-        files,
         stdinSab: this._stdinSab,
       });
     });
   }
 
-  _handleWorkerMessage(e, resolve) {
+  /** Handle messages from an execution worker */
+  _handleExecutionWorkerMessage(e, pid, resolve) {
     const msg = e.data;
     if (msg.type === 'stdout') {
       this.outputCallback(msg.data);
     } else if (msg.type === 'exit') {
-      if (resolve) resolve(msg.code);
+      if (pid === 1 && resolve) {
+        resolve(msg.code);
+      }
+      // Notify kernel of worker exit
+      this._kernelWorker.postMessage({ type: 'worker-exit', pid, code: msg.code });
+      this._executionWorkers.delete(pid);
+      // Recycle non-PID-1 workers back to pool
+      if (pid !== 1) {
+        const worker = this._executionWorkers.get(pid) || e.target;
+        this._recycleWorker(worker);
+      }
     } else if (msg.type === 'error') {
-      console.error('Engine error:', msg.message);
-    } else if (msg.type === 'fork') {
-      this._spawnChildWorker(msg);
-    } else if (msg.type === 'fork-exec') {
-      this._spawnForkExecWorker(msg);
+      console.error('Execution worker error (pid ' + pid + '):', msg.message);
     } else if (msg.type === 'debug') {
-      console.log('[Worker]', msg.message);
+      console.log('[Worker pid=' + pid + ']', msg.message);
+    } else if (msg.type === 'reset-ack') {
+      // Worker confirmed reset — already back in pool
+    }
+  }
+
+  /** Handle messages from the kernel worker */
+  _handleKernelMessage(e) {
+    const msg = e.data;
+    if (msg.type === 'fork-request') {
+      this._spawnChildWorker(msg);
     } else if (msg.type === 'socket-open') {
       this._handleSocketOpen(msg);
     } else if (msg.type === 'socket-connect') {
@@ -130,6 +191,16 @@ export class AtuaComputer {
       this._handleDnsQuery(msg);
     } else if (msg.type === 'http-fetch') {
       this._handleHttpFetch(msg);
+    } else if (msg.type === 'stdout') {
+      this.outputCallback(msg.data);
+    } else if (msg.type === 'debug') {
+      console.log('[Kernel]', msg.message);
+    } else if (msg.type === 'error') {
+      console.error('Kernel error:', msg.message);
+    } else if (msg.type === 'init-done') {
+      // Kernel VFS initialized
+    } else if (msg.type === 'worker-registered') {
+      // Worker registered with kernel
     }
   }
 
@@ -146,101 +217,96 @@ export class AtuaComputer {
     Atomics.notify(this._stdinControl, 2); // wake worker's Atomics.wait
   }
 
+  /** Spawn a child execution worker in response to a fork-request from kernel */
   _spawnChildWorker(msg) {
-    const { guestPagesSab, forkState, forkStateLen, parentBrk, pid, vfsState, hostOpenFiles, waitFlag, pipeSabs } = msg;
+    const { pid, forkType, forkState, forkStateLen, guestPagesSab, parentBrk,
+            vfsState, hostOpenFiles, waitFlag, pipeSabs,
+            path, argv, env } = msg;
 
-    // Phase 2e: Grab a Worker from the pool, or create one if pool is empty
+    // Grab a worker from the pool, or create one if pool is empty
     const child = this._workerPool.length > 0
       ? this._workerPool.pop()
-      : new Worker('/engine-worker.js');
-    this._children.set(pid, child);
+      : new Worker('/execution-worker.js');
+    this._executionWorkers.set(pid, child);
+
+    // Allocate SABs for child
+    const childControlSab = new SharedArrayBuffer(256);
+    const childDataSab = new SharedArrayBuffer(1024 * 1024); // 1MB
 
     child.onmessage = (ce) => {
       if (ce.data.type === 'stdout') {
-        // Forward child stdout to our output
         this.outputCallback(ce.data.data);
       } else if (ce.data.type === 'exit') {
-        // Signal parent Worker that child exited
-        this._worker.postMessage({ type: 'child-exit', pid: ce.data.pid, code: ce.data.code });
-        // Store exit code and set flag in SAB — parent reads from SAB directly
+        // Notify kernel that child exited
+        this._kernelWorker.postMessage({
+          type: 'worker-exit',
+          pid: ce.data.pid,
+          code: ce.data.code,
+        });
+        // Signal parent via waitFlag SAB if provided
         if (waitFlag) {
           const view = new Int32Array(waitFlag);
           Atomics.store(view, 1, ce.data.code || 0); // exit code at index 1
           Atomics.store(view, 0, 1); // done flag at index 0
           Atomics.notify(view, 0);
         }
-        this._children.delete(pid);
-        // Phase 2e: Reset and return Worker to pool for reuse
+        this._executionWorkers.delete(pid);
         this._recycleWorker(child);
       } else if (ce.data.type === 'reset-ack') {
-        // Worker confirmed reset — already back in pool, ready for reuse
+        // Worker confirmed reset — already back in pool
+      } else if (ce.data.type === 'debug') {
+        console.log('[Worker pid=' + pid + ']', ce.data.message);
       }
     };
 
     child.onerror = (err) => {
-      console.error('Child Worker error:', err.message);
+      console.error('Child execution worker error (pid ' + pid + '):', err.message);
     };
 
-    child.postMessage({
-      type: 'restore-fork',
-      guestPagesSab,
-      forkState,
-      forkStateLen,
-      parentBrk,
+    // Register child's SABs with kernel
+    this._kernelWorker.postMessage({
+      type: 'register-worker',
       pid,
-      engineModule: this._engineModule,
-      vfsState: vfsState || {},
-      hostOpenFiles: hostOpenFiles || {},
-      pipeSabs: pipeSabs || {},
+      controlSab: childControlSab,
+      dataSab: childDataSab,
     });
+
+    // Send appropriate boot message to child based on fork type
+    if (forkType === 'fork-exec') {
+      child.postMessage({
+        type: 'fork-exec',
+        pid,
+        path,
+        argv,
+        env,
+        controlSab: childControlSab,
+        dataSab: childDataSab,
+        wakeChannel: this._wakeChannel,
+        engineModule: this._engineModule,
+        vfsState: vfsState || {},
+        pipeSabs: pipeSabs || {},
+      });
+    } else {
+      // restore-fork (full fork with page copy)
+      child.postMessage({
+        type: 'restore-fork',
+        guestPagesSab,
+        forkState,
+        forkStateLen,
+        parentBrk,
+        pid,
+        controlSab: childControlSab,
+        dataSab: childDataSab,
+        wakeChannel: this._wakeChannel,
+        engineModule: this._engineModule,
+        vfsState: vfsState || {},
+        hostOpenFiles: hostOpenFiles || {},
+        pipeSabs: pipeSabs || {},
+      });
+    }
   }
 
-  /** Phase 2c: fork+exec fast path — spawn a child Worker that runs the
-   *  program directly without restoring fork state or copying guest pages.
-   *  Saves ~6MB per fork+exec (8.8KB fork blob + 5.8MB SAB page copy). */
-  _spawnForkExecWorker(msg) {
-    const { pid, path, argv, env, vfsState, waitFlag, pipeSabs } = msg;
-
-    const child = this._workerPool.length > 0
-      ? this._workerPool.pop()
-      : new Worker('/engine-worker.js');
-    this._children.set(pid, child);
-
-    child.onmessage = (ce) => {
-      if (ce.data.type === 'stdout') {
-        this.outputCallback(ce.data.data);
-      } else if (ce.data.type === 'exit') {
-        this._worker.postMessage({ type: 'child-exit', pid: ce.data.pid, code: ce.data.code });
-        if (waitFlag) {
-          const view = new Int32Array(waitFlag);
-          Atomics.store(view, 1, ce.data.code || 0);
-          Atomics.store(view, 0, 1);
-          Atomics.notify(view, 0);
-        }
-        this._children.delete(pid);
-        this._recycleWorker(child);
-      } else if (ce.data.type === 'reset-ack') {
-        // Worker confirmed reset
-      }
-    };
-
-    child.onerror = (err) => {
-      console.error('Fork-exec child Worker error:', err.message);
-    };
-
-    child.postMessage({
-      type: 'fork-exec',
-      pid,
-      path,
-      argv,
-      env,
-      engineModule: this._engineModule,
-      vfsState: vfsState || {},
-      pipeSabs: pipeSabs || {},
-    });
-  }
-
-  /** Phase 2e: Send reset message to Worker and return it to the pool */
+  /** Send reset message to worker and return it to the pool */
   _recycleWorker(worker) {
     worker.postMessage({ type: 'reset' });
     this._workerPool.push(worker);
