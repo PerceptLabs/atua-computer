@@ -85,18 +85,29 @@ export class AtuaComputer {
       console.error('Kernel worker error:', e.message);
     };
 
-    // Send init message to kernel with rootfs and files
-    this._kernelWorker.postMessage({
-      type: 'init',
-      rootfsTar,
-      files,
-      stdinSab: this._stdinSab,
-    });
-
-    // Pre-spawn 4 execution workers into the pool for fork children
+    // Pre-spawn 4 execution workers into the pool for fork children (in parallel with init)
     for (let i = 0; i < 4; i++) {
       this._workerPool.push(new Worker('/execution-worker.js'));
     }
+
+    // Send init message to kernel with rootfs and files, wait for completion
+    await new Promise((resolve, reject) => {
+      const origHandler = this._kernelWorker.onmessage;
+      this._kernelWorker.onmessage = (e) => {
+        if (e.data.type === 'init-done') {
+          this._kernelWorker.onmessage = origHandler;
+          resolve();
+        } else {
+          origHandler(e);
+        }
+      };
+      this._kernelWorker.postMessage({
+        type: 'init',
+        rootfsTar,
+        files,
+        stdinSab: this._stdinSab,
+      });
+    });
 
     // Allocate SABs for PID 1
     const pid1ControlSab = new SharedArrayBuffer(256);
@@ -165,6 +176,14 @@ export class AtuaComputer {
         const worker = this._executionWorkers.get(pid) || e.target;
         this._recycleWorker(worker);
       }
+    } else if (msg.type === 'memory-ready') {
+      this._kernelWorker.postMessage({
+        type: 'register-memory',
+        pid: msg.pid,
+        wasmMemoryBuffer: msg.wasmMemoryBuffer,
+      });
+    } else if (msg.type === 'pipe-sab') {
+      this._kernelWorker.postMessage(msg);
     } else if (msg.type === 'error') {
       console.error('Execution worker error (pid ' + pid + '):', msg.message);
     } else if (msg.type === 'debug') {
@@ -191,6 +210,10 @@ export class AtuaComputer {
       this._handleDnsQuery(msg);
     } else if (msg.type === 'http-fetch') {
       this._handleHttpFetch(msg);
+    } else if (msg.type === 'pipe-fd-cache') {
+      // Relay pipe SABs from kernel to the correct execution worker
+      const worker = this._executionWorkers.get(msg.pid);
+      if (worker) worker.postMessage(msg);
     } else if (msg.type === 'stdout') {
       this.outputCallback(msg.data);
     } else if (msg.type === 'debug') {
@@ -219,9 +242,10 @@ export class AtuaComputer {
 
   /** Spawn a child execution worker in response to a fork-request from kernel */
   _spawnChildWorker(msg) {
-    const { pid, forkType, forkState, forkStateLen, guestPagesSab, parentBrk,
-            vfsState, hostOpenFiles, waitFlag, pipeSabs,
-            path, argv, env } = msg;
+    const { pid: parentPid, childPid, forkType, forkState, forkStateLen,
+            guestPagesSab, parentWasmMemory, parentBrk, vfsState, hostOpenFiles, waitFlag,
+            pipeSabs, pipeFds, path, argv, env } = msg;
+    const pid = childPid || (parentPid + 1);
 
     // Grab a worker from the pool, or create one if pool is empty
     const child = this._workerPool.length > 0
@@ -254,6 +278,13 @@ export class AtuaComputer {
         this._recycleWorker(child);
       } else if (ce.data.type === 'reset-ack') {
         // Worker confirmed reset — already back in pool
+      } else if (ce.data.type === 'memory-ready') {
+        // Relay shared WASM memory buffer to kernel so it can access child's memory
+        this._kernelWorker.postMessage({
+          type: 'register-memory',
+          pid: ce.data.pid,
+          wasmMemoryBuffer: ce.data.wasmMemoryBuffer,
+        });
       } else if (ce.data.type === 'debug') {
         console.log('[Worker pid=' + pid + ']', ce.data.message);
       }
@@ -283,20 +314,20 @@ export class AtuaComputer {
         dataSab: childDataSab,
         wakeChannel: this._wakeChannel,
         engineModule: this._engineModule,
-        vfsState: vfsState || {},
-        pipeSabs: pipeSabs || {},
+        pipeFds: pipeFds || [],
       });
     } else {
       // restore-fork (full fork with page copy)
       child.postMessage({
         type: 'restore-fork',
-        guestPagesSab,
+        guestPagesSab: parentWasmMemory || guestPagesSab,
         forkState,
         forkStateLen,
         parentBrk,
         pid,
         controlSab: childControlSab,
         dataSab: childDataSab,
+        pipeFds: pipeFds || [],
         wakeChannel: this._wakeChannel,
         engineModule: this._engineModule,
         vfsState: vfsState || {},

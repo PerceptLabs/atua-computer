@@ -4,6 +4,18 @@
 
 This project is `atua-computer`, a browser-native Linux userspace runtime for agents. The authoritative spec is `atua-computer.md` in the repo root. The implementation companion is `atua-computer-implementation-addendum.md`. The CC implementation brief is `atua-computer-cc-brief.md`. Read all three before any implementation work.
 
+## Engineering Principles — No Half Measures
+
+Every implementation must be robust, performant, and future-ready. No shortcuts. No hacks. No "temporary" workarounds that become permanent.
+
+- **No partial implementations.** If a syscall handler needs fd routing, implement the full fd table lookup. Do not add `if (fd >= 200) return success` hacks.
+- **No guessing internal state.** If the kernel needs to know what fd numbers Blink assigns for pipes, add a proper registration syscall. Do not hardcode `200 + pipeId * 2`.
+- **No fallback paths.** One source of truth per data structure. If `proc.fdTable` is the fd routing table, do NOT also check `vfs.openFiles` as a fallback. EBADF means EBADF.
+- **No magic numbers.** Use named constants. Document struct offsets. Parse binary formats with explicit field-by-field reads.
+- **Use existing code.** Before writing anything: does Blink already handle this? Does a library exist? Does the plan specify an approach? Only write new code for glue.
+- **Ship the proper fix.** If the proper fix requires a C change + WASM rebuild, do it. Do not ship a JS workaround that avoids the rebuild. The workaround becomes permanent debt.
+- **Mark technical debt explicitly.** If you MUST ship a temporary workaround, mark it with `// TEMPORARY: <what and why and when to remove>`. Track it. Remove it on schedule.
+
 ## Absolute Rules
 
 ### No stubs. No mocks. No fakes. No canned output.

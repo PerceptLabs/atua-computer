@@ -2,3 +2,4 @@ node_modules/
 *.log
 wasm/debian-rootfs.tar
 test-results/
+wasix-bridge/target/

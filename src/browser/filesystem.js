@@ -4,6 +4,8 @@
  * Used by atua WASM imports (fs_open, fs_read, etc.) and host_syscall dispatch.
  */
 
+import untar from './untar.js';
+
 export class VirtualFS {
   constructor() {
     this.files = new Map();       // path → Uint8Array (base + overlay)
@@ -23,47 +25,23 @@ export class VirtualFS {
 
   /**
    * Load files from a tar archive (base layer, read-only).
-   * Supports basic POSIX tar (ustar) format.
+   * Uses untar-sync (MIT, handles PAX extended headers for long filenames).
    */
   async loadTar(tarData) {
-    const data = tarData instanceof Uint8Array ? tarData : new Uint8Array(tarData);
-    let offset = 0;
-
-    while (offset + 512 <= data.length) {
-      const header = data.subarray(offset, offset + 512);
-      offset += 512;
-
-      if (header.every(b => b === 0)) break;
-
-      let name = '';
-      for (let i = 0; i < 100 && header[i]; i++) name += String.fromCharCode(header[i]);
-
-      let prefix = '';
-      if (header[257] === 0x75 && header[258] === 0x73 && header[259] === 0x74) {
-        for (let i = 345; i < 500 && header[i]; i++) prefix += String.fromCharCode(header[i]);
-      }
-      if (prefix) name = prefix + '/' + name;
-
+    const buf = tarData instanceof ArrayBuffer ? tarData
+      : tarData.buffer.slice(tarData.byteOffset, tarData.byteOffset + tarData.byteLength);
+    const files = untar(buf);
+    for (const file of files) {
+      let name = file.name;
       if (name.startsWith('./')) name = name.substring(2);
       if (!name.startsWith('/')) name = '/' + name;
       name = name.replace(/\/+$/, '');
-      if (!name || name === '/') { offset = (offset + 511) & ~511; continue; }
+      if (!name || name === '/') continue;
 
-      let sizeStr = '';
-      for (let i = 124; i < 136 && header[i] >= 0x30; i++) sizeStr += String.fromCharCode(header[i]);
-      const size = parseInt(sizeStr.trim(), 8) || 0;
-
-      let modeStr = '';
-      for (let i = 100; i < 108 && header[i] >= 0x30; i++) modeStr += String.fromCharCode(header[i]);
-      const mode = parseInt(modeStr.trim(), 8) || 0o755;
-
-      const typeflag = header[156];
-
-      if (typeflag === 0x35 || typeflag === 53 || name.endsWith('/')) {
+      if (file.type === '5' || (file.type === '' && name.endsWith('/'))) {
         this._registerDir(name);
-      } else if (typeflag === 2 || typeflag === 0x32) {
-        let linkname = '';
-        for (let i = 157; i < 257 && header[i]; i++) linkname += String.fromCharCode(header[i]);
+      } else if (file.type === '2') {
+        let linkname = file.linkname;
         if (!linkname.startsWith('/')) {
           const dir = name.substring(0, name.lastIndexOf('/') + 1);
           linkname = dir + linkname;
@@ -73,22 +51,16 @@ export class VirtualFS {
         this.symlinks.set(name, linkname);
         this.dirs.add(name);
         this._addChild(name);
-      } else if (typeflag === 0 || typeflag === 0x30 || typeflag === 48) {
-        if (size > 0 && offset + size <= data.length) {
-          this.files.set(name, data.slice(offset, offset + size));
-          this._registerParents(name);
-          this._addChild(name);
-          if (mode !== 0o755) {
-            this.metadata.set(name, { mode });
-          }
-        } else if (size === 0) {
-          this.files.set(name, new Uint8Array(0));
-          this._registerParents(name);
-          this._addChild(name);
+      } else if (file.type === '0' || file.type === '') {
+        const content = new Uint8Array(file.buffer);
+        this.files.set(name, content);
+        this._registerParents(name);
+        this._addChild(name);
+        const mode = parseInt(file.mode, 8) || 0o755;
+        if (mode !== 0o755) {
+          this.metadata.set(name, { mode });
         }
       }
-
-      offset += Math.ceil(size / 512) * 512;
     }
   }
 
@@ -150,8 +122,8 @@ export class VirtualFS {
 
   // [1g] Symlink depth 40 (Linux kernel limit), not 10
   resolvePath(path, depth = 0) {
-    if (!this.symlinks || this.symlinks.size === 0 || depth > 40) return path;
     path = this.normalizePath(path);
+    if (!this.symlinks || this.symlinks.size === 0 || depth > 40) return path;
     const parts = path.split('/');
     for (let i = 1; i <= parts.length; i++) {
       const prefix = parts.slice(0, i).join('/');
@@ -384,6 +356,7 @@ export class VirtualFS {
       return dest.length;
     }
 
+    if (!file.content) return 0; // no content (e.g. stdin/stdout special fds)
     const off = typeof offset === 'bigint' ? Number(offset) : (offset || 0);
     const available = file.content.length - off;
     if (available <= 0) return 0;

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build Blink engine for browser — upstream musl libc, atua imports, zero WASI.
 # musl routes all libc I/O through host_syscall. Blink routes guest I/O through atua_* imports.
-set -euo pipefail
+set -eu
 
 BLINK_DIR="/workspace/native/blink"
 WASI_SDK="/opt/wasi-sdk-32.0-x86_64-linux"
@@ -17,6 +17,7 @@ RT="${WASI_SDK}/lib/clang/22/lib/wasm32-unknown-wasi/libclang_rt.builtins.a"
 # Use upstream musl headers. -nostdinc suppresses clang builtins that conflict.
 # -isystem musl/include first, then clang intrinsics (stdarg.h, stddef.h).
 CFLAGS="--target=wasm32-unknown-unknown -nostdinc -ffreestanding \
+  -matomics -mbulk-memory \
   -isystem ${MUSL}/include \
   -isystem ${WASI_SDK}/lib/clang/22/include \
   -O2 -DNDEBUG -D__ATUA_BROWSER__ -DDISABLE_OVERLAYS \
@@ -48,7 +49,7 @@ for src in ${BLINK_DIR}/third_party/libz/*.c; do
 done
 
 # Provide __thread_pointer (musl's pthread_arch.h references it)
-echo "unsigned long __thread_pointer;" | ${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding \
+echo "unsigned long __thread_pointer;" | ${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding -matomics -mbulk-memory \
   -isystem ${MUSL}/include -isystem ${WASI_SDK}/lib/clang/22/include \
   -c -x c - -o "${BUILD_DIR}/tp.o"
 
@@ -58,7 +59,7 @@ cat > "${BUILD_DIR}/sjlj.c" << 'EOF'
 int setjmp(jmp_buf env) { (void)env; return 0; }
 _Noreturn void longjmp(jmp_buf env, int val) { (void)env; (void)val; __builtin_trap(); }
 EOF
-${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding \
+${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding -matomics -mbulk-memory \
   -isystem ${MUSL}/include -isystem ${WASI_SDK}/lib/clang/22/include \
   -c "${BUILD_DIR}/sjlj.c" -o "${BUILD_DIR}/sjlj.o"
 
@@ -68,7 +69,7 @@ static unsigned _exit_code;
 __attribute__((export_name("get_exit_code")))
 unsigned get_exit_code(void) { return _exit_code; }
 EOF
-${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding \
+${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding -matomics -mbulk-memory \
   -isystem ${MUSL}/include -isystem ${WASI_SDK}/lib/clang/22/include \
   -c "${BUILD_DIR}/exitcode.c" -o "${BUILD_DIR}/exitcode.o"
 
@@ -109,7 +110,7 @@ void init_for_fork(void) {
     __wasm_call_ctors();
 }
 EOF
-${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding \
+${CC} --target=wasm32-unknown-unknown -nostdinc -ffreestanding -matomics -mbulk-memory \
   -isystem ${MUSL}/include -isystem ${WASI_SDK}/lib/clang/22/include \
   -c "${BUILD_DIR}/crt1.c" -o "${BUILD_DIR}/crt1.o"
 
@@ -129,7 +130,8 @@ ${WASI_SDK}/bin/wasm-ld \
     ${MUSL}/lib/libc.a \
     ${RT} \
     -z stack-size=1048576 \
-    --export-memory --export=_start --export=init_for_fork --export=restore_fork --export=malloc --export=free --export=get_exit_code \
+    --import-memory --shared-memory --no-check-features --initial-memory=268435456 --max-memory=1073741824 \
+    --export=_start --export=init_for_fork --export=restore_fork --export=malloc --export=free --export=get_exit_code \
     --export=get_pagepool_base --export=get_pagepool_size --export=get_hostpages_count --export=get_hostpages_addrs \
     -o "${OUTPUT}"
 
