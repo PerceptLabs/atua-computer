@@ -435,8 +435,8 @@ function createImports(args, env, stdinSab) {
       if (n === 11) return 0; // munmap — LOCAL no-op
       if (n === 25) return -38; // mremap — ENOSYS
       // Pipe I/O — direct worker-to-worker via SAB, no kernel in data path
-      if (n === 0 && localPipeFds.has(a)) { console.log('[pipe] read fd='+a); return localPipeRead(a, b, c); }
-      if (n === 1 && localPipeFds.has(a)) { console.log('[pipe] write fd='+a+' count='+c); return localPipeWrite(a, b, c); }
+      if (n === 0 && localPipeFds.has(a)) return localPipeRead(a, b, c);
+      if (n === 1 && localPipeFds.has(a)) return localPipeWrite(a, b, c);
       if (n === 19 && localPipeFds.has(a)) return localPipeReadv(a, b, c);
       if (n === 20 && localPipeFds.has(a)) return localPipeWritev(a, b, c);
       // dup2/dup3/close — update local pipe cache synchronously
@@ -495,53 +495,48 @@ function createImports(args, env, stdinSab) {
     /* ── Pipes (trap to kernel) ───────────────────────────────────────── */
 
     pipe_create() {
-      // Create pipe SAB locally so both worker and kernel share the same buffer.
-      // CheerpX pattern: worker does direct I/O, kernel manages metadata.
-      const pipeSab = new SharedArrayBuffer(PIPE_BUF_SIZE + 16);
-      // Send SAB to kernel BEFORE trapping (it'll be queued for processing)
-      const myPid = new Int32Array(self._controlSab)[10];
-      self.postMessage({ type: 'pipe-sab', pid: myPid, sab: pipeSab });
-      // Brief yield to let the message reach the kernel
-      if (!self._growSab) self._growSab = new Int32Array(new SharedArrayBuffer(4));
-      Atomics.wait(self._growSab, 0, 0, 5);
+      // Trap to kernel which calls bridge to allocate pipe ring buffer.
+      // Kernel returns pipeId in control[8], ringOffset in control[9].
       const pipeId = trapToKernel(SYS_PIPE_CREATE, 0, 0, 0, 0, 0, 0);
-      console.log('[pipe_create] pipeId=' + pipeId + ' readFd=' + (200+pipeId*2) + ' writeFd=' + (201+pipeId*2));
-      // Register pipe fds locally (matching kernel's 200+pipeId*2 scheme)
-      const readFd = 200 + pipeId * 2;
-      const writeFd = 200 + pipeId * 2 + 1;
-      localPipeFds.set(readFd, {
-        pipeId, sab: pipeSab,
-        control: new Int32Array(pipeSab, 0, 4),
-        data: new Uint8Array(pipeSab, 16, PIPE_BUF_SIZE),
-        end: 0,
-      });
-      localPipeFds.set(writeFd, {
-        pipeId, sab: pipeSab,
-        control: new Int32Array(pipeSab, 0, 4),
-        data: new Uint8Array(pipeSab, 16, PIPE_BUF_SIZE),
-        end: 1,
-      });
+      if (pipeId < 0) return pipeId; // error
+
+      // Read ringOffset from control[9] (secondary return value)
+      const ctl = new Int32Array(self._controlSab);
+      const ringOffset = Atomics.load(ctl, 9);
+
+      // The kernel also sent pipe-fd-cache via postMessage, but we can't receive
+      // it during this synchronous import. Set up local pipe fds NOW using the
+      // bridge SAB that was shared at boot time.
+      // The bridge SAB is available via self._bridgeSab (set during fork boot or init).
+      const sab = self._bridgeSab;
+      if (sab && ringOffset > 0) {
+        const readFd = 200 + pipeId * 2;
+        const writeFd = 200 + pipeId * 2 + 1;
+        localPipeFds.set(readFd, {
+          pipeId, sab,
+          control: new Int32Array(sab, ringOffset, 4),
+          data: new Uint8Array(sab, ringOffset + 16, PIPE_BUF_SIZE),
+          end: 0,
+        });
+        localPipeFds.set(writeFd, {
+          pipeId, sab,
+          control: new Int32Array(sab, ringOffset, 4),
+          data: new Uint8Array(sab, ringOffset + 16, PIPE_BUF_SIZE),
+          end: 1,
+        });
+      }
       return pipeId;
     },
 
     pipe_read(pipeId, bufPtr, len) {
       const readFd = 200 + pipeId * 2;
-      if (localPipeFds.has(readFd)) {
-        const pipe = localPipeFds.get(readFd);
-        console.log('[pipe_read] pipeId='+pipeId+' fd='+readFd+' len='+len+' wp='+Atomics.load(pipe.control,0)+' rp='+Atomics.load(pipe.control,1)+' closed='+Atomics.load(pipe.control,2));
-        return localPipeRead(readFd, bufPtr, len);
-      }
-      // Fallback to kernel (shouldn't happen if pipe cache is populated)
+      if (localPipeFds.has(readFd)) return localPipeRead(readFd, bufPtr, len);
       return trapToKernel(SYS_PIPE_READ, pipeId, bufPtr, len, 0, 0, 0);
     },
 
     pipe_write(pipeId, bufPtr, len) {
-      const writeFd = 200 + pipeId * 2 + 1; // write end
-      if (localPipeFds.has(writeFd)) {
-        const r = localPipeWrite(writeFd, bufPtr, len);
-        console.log('[pipe_write] pipeId='+pipeId+' fd='+writeFd+' len='+len+' wrote='+r);
-        return r;
-      }
+      const writeFd = 200 + pipeId * 2 + 1;
+      if (localPipeFds.has(writeFd)) return localPipeWrite(writeFd, bufPtr, len);
       return trapToKernel(SYS_PIPE_WRITE, pipeId, bufPtr, len, 0, 0, 0);
     },
 
@@ -848,9 +843,10 @@ async function bootEngine(opts) {
     engineModule, args, env, stdinSab,
   } = opts;
 
-  // Store SABs on self for trapToKernel
+  // Store SABs on self for trapToKernel and pipe I/O
   self._controlSab = controlSab;
   self._wakeChannel = wakeChannel;
+  if (opts.bridgeSab) self._bridgeSab = opts.bridgeSab;
 
   // Write our PID into control[10]
   const ctl = new Int32Array(controlSab);
@@ -998,9 +994,10 @@ async function restoreFork(opts) {
     }
   }
 
-  // Store SABs on self for trapToKernel
+  // Store SABs on self for trapToKernel and pipe I/O
   self._controlSab = controlSab;
   self._wakeChannel = wakeChannel;
+  if (opts.bridgeSab) self._bridgeSab = opts.bridgeSab;
   self._guestPagesSab = guestPagesSab;
 
   // Write our PID into control[10]
@@ -1082,9 +1079,10 @@ async function forkExec(opts) {
     }
   }
 
-  // Store SABs on self for trapToKernel
+  // Store SABs on self for trapToKernel and pipe I/O
   self._controlSab = controlSab;
   self._wakeChannel = wakeChannel;
+  if (opts.bridgeSab) self._bridgeSab = opts.bridgeSab;
 
   // Write our PID into control[10]
   const ctl = new Int32Array(controlSab);
@@ -1165,14 +1163,16 @@ self.onmessage = async (e) => {
       break;
 
     case 'pipe-fd-cache':
-      // Kernel pushes pipe SABs so worker can do direct I/O
+      // Kernel pushes pipe ring buffer info so worker can do direct I/O on bridge SAB.
+      // Each pipe's ring buffer is at ringOffset within the bridge SAB.
       if (msg.updates) {
         for (const u of msg.updates) {
+          const off = u.ringOffset || 0;
           localPipeFds.set(u.fd, {
             pipeId: u.pipeId,
             sab: u.sab,
-            control: new Int32Array(u.sab, 0, 4),
-            data: new Uint8Array(u.sab, 16, PIPE_BUF_SIZE),
+            control: new Int32Array(u.sab, off, 4),
+            data: new Uint8Array(u.sab, off + 16, PIPE_BUF_SIZE),
             end: u.end,
           });
         }

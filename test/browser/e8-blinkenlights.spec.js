@@ -17,6 +17,7 @@ const BROWSER_DIR = resolve(ROOT, 'src/browser');
 const MIME = {
   '.html': 'text/html', '.js': 'application/javascript',
   '.wasm': 'application/wasm', '.tar': 'application/x-tar',
+  '.mjs': 'application/javascript',
 };
 
 let server, serverUrl;
@@ -38,7 +39,7 @@ test.beforeAll(async () => {
       '/execution-worker.js': join(BROWSER_DIR, 'execution-worker.js'),
       '/debian-mini.tar': join(ROOT, 'test/fixtures/debian-mini.tar'),
     };
-    const filePath = map[pathname] || join(BROWSER_DIR, pathname);
+    const filePath = map[pathname] || (pathname.startsWith('/node_modules/') ? join(ROOT, pathname) : join(BROWSER_DIR, pathname));
     const ext = extname(filePath);
     res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
     createReadStream(filePath)

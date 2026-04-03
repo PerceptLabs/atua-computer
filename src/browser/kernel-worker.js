@@ -35,106 +35,68 @@ const vfs = new VirtualFS();
 const processTable = new Map();
 let nextPid = 1;
 
-// Pipe table: pipeId → { sab, control, data }
-const pipes = new Map();
-let nextPipeId = 0;
-const PIPE_BUF_SIZE = 64 * 1024;
+// ─── Bridge SAB transport ─────────────────────────────────────────────────────
+let bridgeSab = null;
+let bridgeRingHeader = null;
+let bridgeRingSlots = null;
+let bridgeData = null;
 
-// Socket table: sockId → { sab, control, data, isUdp }
-const sockets = new Map();
-let nextSockId = 0;
-const SOCK_BUF_SIZE = 128 * 1024;
+const RING_OFFSET = 65536;
+const RING_HEADER_SIZE = 16;
+const RING_SLOTS = 32;
+const RING_SLOT_I32S = 16;
+const DATA_OFFSET = RING_OFFSET + RING_HEADER_SIZE + RING_SLOTS * 64;
+const PIPE_REGION_START = DATA_OFFSET + 1024 * 1024;
+const PIPE_SLOT_SIZE = 64 * 1024 + 16;
+const CALL_TIMEOUT_MS = 5000;
 
-// ─── Pipe helpers ────────────────────────────────────────────────────────────
+const SLOT_REQUEST_ID = 0;
+const SLOT_MSG_TYPE = 1;
+const SLOT_STATUS = 2;
+const SLOT_ERROR = 3;
+const SLOT_PAYLOAD = 4;
 
-function createPipe() {
-  const id = nextPipeId++;
-  // Use worker-provided SAB if available (worker created it for direct I/O)
-  const sab = (self._pendingPipeSabs && self._pendingPipeSabs.length > 0)
-    ? self._pendingPipeSabs.shift()
-    : new SharedArrayBuffer(PIPE_BUF_SIZE + 16);
-  const control = new Int32Array(sab, 0, 4);
-  const data = new Uint8Array(sab, 16, PIPE_BUF_SIZE);
-  pipes.set(id, { sab, control, data });
-  return id;
-}
+const REQ_PIPE_CREATE = 1;
+const REQ_PIPE_CLOSE = 2;
+const REQ_FORK = 10;
+const REQ_PID_ALLOCATE = 14;
+const REQ_EXIT_NOTIFY = 15;
+const REQ_SIGNAL_SEND = 41;
 
-function pipeWrite(pipeId, buf, len) {
-  const pipe = pipes.get(pipeId);
-  if (!pipe) return -1;
-  const { control, data } = pipe;
-  const cap = data.length;
-  let written = 0;
-  for (let i = 0; i < len; i++) {
-    const wp = Atomics.load(control, 0);
-    const next = (wp + 1) % cap;
-    if (next === Atomics.load(control, 1)) break; // full
-    data[wp] = buf[i];
-    Atomics.store(control, 0, next);
-    written++;
+function callBridge(reqType, a0=0, a1=0, a2=0, a3=0, a4=0, a5=0) {
+  if (!bridgeRingHeader) throw new Error('[kernel] Bridge not initialized');
+  const reqId = Atomics.add(bridgeRingHeader, 2, 1);
+  const writePos = Atomics.add(bridgeRingHeader, 0, 1);
+  const slotIndex = writePos % RING_SLOTS;
+  const slotBase = slotIndex * RING_SLOT_I32S;
+  while (Atomics.load(bridgeRingSlots, slotBase + SLOT_STATUS) !== 0) {
+    Atomics.wait(bridgeRingSlots, slotBase + SLOT_STATUS, 2, 100);
+    Atomics.wait(bridgeRingSlots, slotBase + SLOT_STATUS, 1, 100);
   }
-  Atomics.notify(control, 1); // wake reader
-  return written;
-}
-
-function pipeRead(pipeId, buf, len) {
-  const pipe = pipes.get(pipeId);
-  if (!pipe) return -1;
-  const { control, data } = pipe;
-  const cap = data.length;
-  let bytesRead = 0;
-  // Non-blocking: read what's available, return immediately
-  // The kernel is single-threaded — blocking here deadlocks all processes
-  while (bytesRead < len) {
-    const wp = Atomics.load(control, 0);
-    const rp = Atomics.load(control, 1);
-    if (rp === wp) {
-      if (Atomics.load(control, 2) === 1) break; // write end closed = EOF
-      break; // no data available — return what we have
-    }
-    buf[bytesRead] = data[rp];
-    Atomics.store(control, 1, (rp + 1) % cap);
-    bytesRead++;
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_REQUEST_ID, reqId);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_MSG_TYPE, reqType);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_ERROR, 0);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 0, a0);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 1, a1);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 2, a2);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 3, a3);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 4, a4);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 5, a5);
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_STATUS, 1);
+  const waitResult = Atomics.wait(bridgeRingSlots, slotBase + SLOT_STATUS, 1, CALL_TIMEOUT_MS);
+  if (waitResult === 'timed-out') {
+    Atomics.store(bridgeRingSlots, slotBase + SLOT_STATUS, 0);
+    return { val: 0, r1: 0, r2: 0, r3: 0, err: 110 };
   }
-  // If no data read and write end still open, return EAGAIN
-  if (bytesRead === 0 && Atomics.load(control, 2) !== 1) return -11; // EAGAIN
-  return bytesRead;
-}
-
-function pipeClose(pipeId, end) {
-  const pipe = pipes.get(pipeId);
-  if (!pipe) return;
-  if (end === 1) { // write end
-    Atomics.store(pipe.control, 2, 1);
-    Atomics.notify(pipe.control, 1);
-  } else { // read end
-    Atomics.store(pipe.control, 3, 1);
-  }
-}
-
-// ─── Socket recv helper ──────────────────────────────────────────────────────
-
-function socketRecvToArray(sockId, buf, len) {
-  const sock = sockets.get(sockId);
-  if (!sock) return -1;
-  const { control, data } = sock;
-  const cap = data.length;
-  let bytesRead = 0;
-  while (bytesRead < len) {
-    const wp = Atomics.load(control, 0);
-    const rp = Atomics.load(control, 1);
-    if (rp === wp) {
-      if (Atomics.load(control, 2) === 1) break;
-      if (bytesRead > 0) break;
-      if (sock.isUdp) return -1;
-      Atomics.wait(control, 1, rp, 5000);
-      continue;
-    }
-    buf[bytesRead] = data[rp % cap];
-    Atomics.store(control, 1, rp + 1);
-    bytesRead++;
-  }
-  return bytesRead;
+  const result = {
+    val: Atomics.load(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 0),
+    r1:  Atomics.load(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 1),
+    r2:  Atomics.load(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 2),
+    r3:  Atomics.load(bridgeRingSlots, slotBase + SLOT_PAYLOAD + 3),
+    err: Atomics.load(bridgeRingSlots, slotBase + SLOT_ERROR),
+  };
+  Atomics.store(bridgeRingSlots, slotBase + SLOT_STATUS, 0);
+  return result;
 }
 
 // ─── Per-process fd table helpers ────────────────────────────────────────────
@@ -323,17 +285,8 @@ function handleSyscall(pid, control, data) {
         result = 0; break;
       }
       if (entry.type === 'pipe') {
-        const dest = new Uint8Array(count);
-        const n2 = pipeRead(entry.pipeId, dest, count);
-        if (n2 === -11) {
-          // EAGAIN — no data yet, pipe still open. Store pending read.
-          // The kernel loop will retry on next iteration.
-          if (!self._pendingPipeReads) self._pendingPipeReads = [];
-          self._pendingPipeReads.push({ pid, control, wasm, wasmDV, fd: a, entry, bufPtr: b >>> 0, count });
-          return; // DON'T set control[8] or notify — worker stays blocked
-        }
-        if (n2 > 0 && wasm) wasm.set(dest.subarray(0, n2), b >>> 0);
-        result = n2;
+        // Pipe data goes through direct worker SAB I/O, not through the kernel
+        result = -38; // ENOSYS — handled by worker direct I/O
         break;
       }
       if (entry.type === 'file' || entry.type === 'dir') {
@@ -367,7 +320,8 @@ function handleSyscall(pid, control, data) {
         break;
       }
       if (entry.type === 'pipe') {
-        result = pipeWrite(entry.pipeId, buf, count);
+        // Pipe data goes through direct worker SAB I/O, not through the kernel
+        result = -38; // ENOSYS — handled by worker direct I/O
         break;
       }
       if (entry.type === 'file') {
@@ -399,7 +353,10 @@ function handleSyscall(pid, control, data) {
       if (entry3.type === 'file' || entry3.type === 'dir') {
         vfs.close(entry3.vfsFd);
       } else if (entry3.type === 'pipe') {
-        pipeClose(entry3.pipeId, entry3.end);
+        if (bridgeSab) {
+          // Notify bridge to set the closed flag on the pipe ring buffer
+          callBridge(REQ_PIPE_CLOSE, a);
+        }
         // Notify worker to remove from local pipe cache
         self.postMessage({ type: 'pipe-fd-cache', pid, removes: [a] });
       }
@@ -518,33 +475,8 @@ function handleSyscall(pid, control, data) {
         result = 0; break;
       }
       if (entry.type === 'pipe') {
-        // First iov — try non-blocking read
-        const iov0Base = wasmDV.getUint32((b >>> 0), true);
-        const iov0Len = wasmDV.getUint32((b >>> 0) + 4, true);
-        const dest0 = new Uint8Array(iov0Len);
-        const n0 = pipeRead(entry.pipeId, dest0, iov0Len);
-        if (n0 === -11) {
-          // EAGAIN — store pending readv, retry later
-          if (!self._pendingPipeReads) self._pendingPipeReads = [];
-          self._pendingPipeReads.push({ pid, control, wasm, wasmDV, fd: a, entry, bufPtr: iov0Base, count: iov0Len, isReadv: true, iovPtr: b >>> 0, iovcnt });
-          return;
-        }
-        if (n0 > 0) wasm.set(dest0.subarray(0, n0), iov0Base);
-        total += Math.max(n0, 0);
-        // Read remaining iovecs if first was fully satisfied
-        if (n0 >= iov0Len) {
-          for (let i = 1; i < iovcnt; i++) {
-            const iovBase = wasmDV.getUint32((b >>> 0) + i * 8, true);
-            const iovLen = wasmDV.getUint32((b >>> 0) + i * 8 + 4, true);
-            const dest = new Uint8Array(iovLen);
-            const n2 = pipeRead(entry.pipeId, dest, iovLen);
-            if (n2 <= 0) break;
-            wasm.set(dest.subarray(0, n2), iovBase);
-            total += n2;
-            if (n2 < iovLen) break;
-          }
-        }
-        result = total;
+        // Pipe data goes through direct worker SAB I/O, not through the kernel
+        result = -38; // ENOSYS — handled by worker direct I/O
         break;
       }
       if (entry.type === 'file' || entry.type === 'dir') {
@@ -599,13 +531,8 @@ function handleSyscall(pid, control, data) {
         result = 0; break;
       }
       if (entry.type === 'pipe') {
-        for (let i = 0; i < iovcnt; i++) {
-          const iovBase = wasmDV.getUint32((b >>> 0) + i * 8, true);
-          const iovLen = wasmDV.getUint32((b >>> 0) + i * 8 + 4, true);
-          const buf = wasm.slice(iovBase, iovBase + iovLen);
-          total += pipeWrite(entry.pipeId, buf, iovLen);
-        }
-        result = total;
+        // Pipe data goes through direct worker SAB I/O, not through the kernel
+        result = -38; // ENOSYS — handled by worker direct I/O
         break;
       }
       if (entry.type === 'file') {
@@ -765,13 +692,10 @@ function handleSyscall(pid, control, data) {
       if (b >= proc.nextFd) proc.nextFd = b + 1;
       // If pipe fd was duplicated, push cache update to worker
       if (entry.type === 'pipe') {
-        const pipe = pipes.get(entry.pipeId);
-        if (pipe) {
-          self.postMessage({
-            type: 'pipe-fd-cache', pid,
-            updates: [{ fd: b, pipeId: entry.pipeId, end: entry.end, sab: pipe.sab }]
-          });
-        }
+        self.postMessage({
+          type: 'pipe-fd-cache', pid,
+          updates: [{ fd: b, end: entry.end, ringOffset: entry.ringOffset, sab: bridgeSab }]
+        });
       }
       result = b;
       break;
@@ -784,7 +708,7 @@ function handleSyscall(pid, control, data) {
       const existing = proc.fdTable.get(b);
       if (existing) {
         if (existing.type === 'file' || existing.type === 'dir') vfs.close(existing.vfsFd);
-        else if (existing.type === 'pipe') pipeClose(existing.pipeId, existing.end);
+        else if (existing.type === 'pipe' && bridgeSab) callBridge(REQ_PIPE_CLOSE, b);
         proc.fdTable.delete(b);
       }
       proc.fdTable.set(b, { ...entry, cloexec: !!(c & 0x80000) });
@@ -1320,7 +1244,7 @@ function handleSyscall(pid, control, data) {
       break;
     case 1009: { // SYS_FORK_SPAWN (full fork with state restoration)
       // a=statePtr in WASM memory, b=stateLen
-      const childPid = nextPid++;
+      const childPid = bridgeSab ? callBridge(REQ_FORK).val : nextPid++;
       // Duplicate parent's fd table for child
       const parentFds = proc.fdTable;
       const childFds = new Map(parentFds);
@@ -1339,8 +1263,7 @@ function handleSyscall(pid, control, data) {
       const pipeFds1009 = [];
       for (const [fd, fentry] of childFds) {
         if (fentry.type === 'pipe') {
-          const pipe = pipes.get(fentry.pipeId);
-          if (pipe) pipeFds1009.push({ fd, pipeId: fentry.pipeId, end: fentry.end, sab: pipe.sab });
+          pipeFds1009.push({ fd, end: fentry.end, ringOffset: fentry.ringOffset, sab: bridgeSab });
         }
       }
       self.postMessage({
@@ -1395,8 +1318,7 @@ function handleSyscall(pid, control, data) {
       const pipeFds1010 = [];
       for (const [fd1010, entry1010] of childFds) {
         if (entry1010.type === 'pipe') {
-          const pipe1010 = pipes.get(entry1010.pipeId);
-          if (pipe1010) pipeFds1010.push({ fd: fd1010, pipeId: entry1010.pipeId, end: entry1010.end, sab: pipe1010.sab });
+          pipeFds1010.push({ fd: fd1010, end: entry1010.end, ringOffset: entry1010.ringOffset, sab: bridgeSab });
         }
       }
       self.postMessage({
@@ -1428,65 +1350,55 @@ function handleSyscall(pid, control, data) {
       // DON'T set control[8] or notify — leave parent blocked until child exits
       return; // skip the control[8] = result at the end
     }
-    case 1012: { // SYS_PIPE_CREATE — returns pipe id
-      const pipeId = createPipe();
-      const pipe = pipes.get(pipeId);
-      // TEMPORARY: Blink assigns pipe fds as 200+pipeId*2 (read) and 200+pipeId*2+1 (write)
-      // TODO: Replace with SYS_REGISTER_PIPE_FD from C side for proper fd registration
-      const readFd = 200 + pipeId * 2;
-      const writeFd = 200 + pipeId * 2 + 1;
-      proc.fdTable.set(readFd, { type: 'pipe', pipeId, end: 0 });
-      proc.fdTable.set(writeFd, { type: 'pipe', pipeId, end: 1 });
-      // Push pipe SABs to worker for direct I/O (CheerpX pattern — no kernel in data path)
-      if (pipe) {
+    case 1012: { // SYS_PIPE_CREATE
+      if (bridgeSab) {
+        const resp = callBridge(REQ_PIPE_CREATE);
+        if (resp.err) { result = -resp.err; break; }
+        const readFd = resp.val;
+        const writeFd = resp.r1;
+        const ringOffset = resp.r2;
+        proc.fdTable.set(readFd, { type: 'pipe', end: 0, ringOffset, cloexec: false });
+        proc.fdTable.set(writeFd, { type: 'pipe', end: 1, ringOffset, cloexec: false });
+        // Push pipe ring info to execution workers for direct I/O
         self.postMessage({
           type: 'pipe-fd-cache', pid,
           updates: [
-            { fd: readFd, pipeId, end: 0, sab: pipe.sab },
-            { fd: writeFd, pipeId, end: 1, sab: pipe.sab },
+            { fd: readFd, end: 0, ringOffset, sab: bridgeSab },
+            { fd: writeFd, end: 1, ringOffset, sab: bridgeSab },
           ]
         });
+        // Return pipeId in control[8], ringOffset in control[9]
+        // The execution worker computes readFd/writeFd from pipeId
+        const pipeId = (readFd - 100) / 2;
+        control[9] = ringOffset; // secondary return value
+        result = pipeId;
+      } else {
+        result = -38; // ENOSYS — no bridge
       }
-      result = pipeId;
       break;
     }
-    case 1013: { // SYS_PIPE_READ(pipeId=a, bufPtr=b, len=c)
-      const len = Math.min(c >>> 0, 65536);
-      const buf = new Uint8Array(len);
-      const n2 = pipeRead(a, buf, len);
-      if (n2 > 0 && wasm) wasm.set(buf.subarray(0, n2), b >>> 0);
-      result = n2;
-      break;
-    }
-    case 1014: { // SYS_PIPE_WRITE(pipeId=a, bufPtr=b, len=c)
-      const len = c >>> 0;
-      const src = wasm ? wasm.slice(b >>> 0, (b >>> 0) + len) : new Uint8Array(0);
-      result = pipeWrite(a, src, len);
-      break;
-    }
-    case 1015: { // SYS_PIPE_CLOSE(pipeId=a, end=b)
-      pipeClose(a, b);
+    case 1013: result = -38; break; // SYS_PIPE_READ — handled by worker direct I/O
+    case 1014: result = -38; break; // SYS_PIPE_WRITE — handled by worker direct I/O
+    case 1015: { // SYS_PIPE_CLOSE
+      if (bridgeSab) {
+        const entry = proc.fdTable.get(a);
+        if (entry && entry.type === 'pipe') {
+          // Tell bridge to close the pipe end
+          callBridge(REQ_PIPE_CLOSE, a);
+        }
+      }
+      // Also remove from fd table
+      const entry = proc.fdTable.get(a);
+      if (entry) proc.fdTable.delete(a);
       result = 0;
       break;
     }
-    case 1016: // SYS_SOCKET_OPEN — stub
-      result = -97;
-      break;
-    case 1017: // SYS_SOCKET_CONNECT — stub
-      result = -38;
-      break;
-    case 1018: // SYS_SOCKET_SEND — stub
-      result = -38;
-      break;
-    case 1019: // SYS_SOCKET_RECV — stub
-      result = -38;
-      break;
-    case 1020: // SYS_SOCKET_CLOSE — stub
-      result = 0;
-      break;
-    case 1021: // SYS_SOCKET_POLL — stub
-      result = 0;
-      break;
+    case 1016: result = bridgeSab ? -38 : -97; break; // SYS_SOCKET_OPEN
+    case 1017: result = -38; break; // SYS_SOCKET_CONNECT
+    case 1018: result = -38; break; // SYS_SOCKET_SEND
+    case 1019: result = -38; break; // SYS_SOCKET_RECV
+    case 1020: result = -38; break; // SYS_SOCKET_CLOSE
+    case 1021: result = -38; break; // SYS_SOCKET_POLL
     case 1022: { // SYS_GETCWD — a=bufPtr in WASM memory
       const proc2 = processTable.get(pid);
       const cwd = proc2 ? proc2.cwd : '/';
@@ -1568,33 +1480,6 @@ async function kernelLoop() {
       }
     }
 
-    // Retry pending pipe reads — check if pipe has data now
-    if (self._pendingPipeReads && self._pendingPipeReads.length > 0) {
-      const pending = self._pendingPipeReads;
-      self._pendingPipeReads = [];
-      for (const pr of pending) {
-        const dest = new Uint8Array(pr.count);
-        const n2 = pipeRead(pr.entry.pipeId, dest, pr.count);
-        if (n2 === -11) {
-          // Still no data — re-queue
-          if (!self._pendingPipeReads) self._pendingPipeReads = [];
-          self._pendingPipeReads.push(pr);
-        } else {
-          // Got data (or EOF) — complete the syscall
-          if (n2 > 0 && pr.wasm) {
-            // Refresh wasm view in case memory grew
-            const proc = processTable.get(pr.pid);
-            const freshWasm = proc?.wasmMemory ? new Uint8Array(proc.wasmMemory) : pr.wasm;
-            freshWasm.set(dest.subarray(0, n2), pr.bufPtr);
-          }
-          pr.control[8] = n2;
-          Atomics.store(pr.control, 0, 0);
-          Atomics.notify(pr.control, 0);
-          handled = true;
-        }
-      }
-    }
-
     if (!handled) {
       if (processTable.size === 0) {
         await new Promise(resolve => setTimeout(resolve, 1));
@@ -1629,6 +1514,14 @@ self.onmessage = async (e) => {
       // Store config
       if (msg.config) {
         // Future: store environment, rootfs URL, etc.
+      }
+      // Initialize bridge SAB if provided
+      if (msg.bridgeSab) {
+        bridgeSab = msg.bridgeSab;
+        bridgeRingHeader = new Int32Array(bridgeSab, RING_OFFSET, 4);
+        bridgeRingSlots = new Int32Array(bridgeSab, RING_OFFSET + RING_HEADER_SIZE, RING_SLOTS * RING_SLOT_I32S);
+        bridgeData = new Uint8Array(bridgeSab, DATA_OFFSET, 1024 * 1024);
+        console.log('[kernel] Bridge SAB initialized, ' + bridgeSab.byteLength + ' bytes');
       }
       self.postMessage({ type: 'init-done' });
 
@@ -1674,13 +1567,6 @@ self.onmessage = async (e) => {
         proc.wasmMemory = msg.wasmMemoryBuffer;
         proc.wasmView = new Uint8Array(msg.wasmMemoryBuffer);
       }
-      break;
-    }
-
-    case 'pipe-sab': {
-      if (!self._pendingPipeSabs) self._pendingPipeSabs = [];
-      self._pendingPipeSabs.push(msg.sab);
-      console.log('[kernel] received pipe-sab, pending=' + self._pendingPipeSabs.length);
       break;
     }
 

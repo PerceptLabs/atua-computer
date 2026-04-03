@@ -20,6 +20,7 @@ const MIME = {
   '.html': 'text/html', '.js': 'application/javascript',
   '.wasm': 'application/wasm', '.elf': 'application/octet-stream',
   '.tar': 'application/x-tar',
+  '.mjs': 'application/javascript',
 };
 
 let server, serverUrl;
@@ -39,7 +40,7 @@ test.beforeAll(async () => {
       '/kernel-worker.js': join(BROWSER_DIR, 'kernel-worker.js'),
       '/execution-worker.js': join(BROWSER_DIR, 'execution-worker.js'),
     };
-    const filePath = fileMap[req.url] || join(BROWSER_DIR, req.url);
+    const filePath = fileMap[req.url] || (req.url.startsWith('/node_modules/') ? join(ROOT, req.url) : join(BROWSER_DIR, req.url));
     const ext = extname(filePath);
     res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
     createReadStream(filePath)

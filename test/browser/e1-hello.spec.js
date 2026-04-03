@@ -22,6 +22,7 @@ const MIME = {
   '.js': 'application/javascript',
   '.wasm': 'application/wasm',
   '.elf': 'application/octet-stream',
+  '.mjs': 'application/javascript',
 };
 
 const FILE_MAP = {
@@ -43,7 +44,7 @@ test.beforeAll(async () => {
   server = createServer((req, res) => {
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
     res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-    const filePath = FILE_MAP[req.url] || join(BROWSER_DIR, req.url);
+    const filePath = FILE_MAP[req.url] || (req.url.startsWith('/node_modules/') ? join(ROOT, req.url) : join(BROWSER_DIR, req.url));
     const ext = extname(filePath);
     res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
     createReadStream(filePath)

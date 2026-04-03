@@ -78,6 +78,27 @@ export class AtuaComputer {
     }
     this._dnsProxyUrl = opts.dnsProxyUrl || null;
 
+    // Boot Wasmer WASIX bridge — provides fork, pipes, threading, signals, sockets
+    let bridgeSab = null;
+    if (opts.bridgeUrl !== false) { // Skip bridge only if explicitly disabled
+      try {
+        const { init: initWasmer, runWasix } = await import('/node_modules/@wasmer/sdk/dist/index.mjs');
+        await initWasmer();
+        const bridgeBytes = await fetch(opts.bridgeUrl || '/wasix-bridge.wasm').then(r => r.arrayBuffer());
+        this._bridgeInstance = await runWasix(new Uint8Array(bridgeBytes), { program: 'wasix-bridge' });
+        const mem = this._bridgeInstance.memory;
+        if (mem && mem.buffer instanceof SharedArrayBuffer) {
+          bridgeSab = mem.buffer;
+          this._bridgeSab = bridgeSab;
+          console.log('[atua] Bridge started, SAB=' + bridgeSab.byteLength + ' bytes');
+        } else {
+          console.warn('[atua] Bridge memory not SharedArrayBuffer — bridge disabled');
+        }
+      } catch (e) {
+        console.warn('[atua] Bridge boot failed:', e.message, '— continuing without bridge');
+      }
+    }
+
     // Create Kernel Worker (module worker — handles syscalls)
     this._kernelWorker = new Worker('/kernel-worker.js', { type: 'module' });
     this._kernelWorker.onmessage = (e) => this._handleKernelMessage(e);
@@ -90,7 +111,7 @@ export class AtuaComputer {
       this._workerPool.push(new Worker('/execution-worker.js'));
     }
 
-    // Send init message to kernel with rootfs and files, wait for completion
+    // Send init message to kernel with rootfs, files, and bridge SAB
     await new Promise((resolve, reject) => {
       const origHandler = this._kernelWorker.onmessage;
       this._kernelWorker.onmessage = (e) => {
@@ -106,6 +127,7 @@ export class AtuaComputer {
         rootfsTar,
         files,
         stdinSab: this._stdinSab,
+        bridgeSab,
       });
     });
 
@@ -155,6 +177,7 @@ export class AtuaComputer {
         args,
         env: opts.env || {},
         stdinSab: this._stdinSab,
+        bridgeSab,
       });
     });
   }
@@ -315,6 +338,7 @@ export class AtuaComputer {
         wakeChannel: this._wakeChannel,
         engineModule: this._engineModule,
         pipeFds: pipeFds || [],
+        bridgeSab: this._bridgeSab || null,
       });
     } else {
       // restore-fork (full fork with page copy)
@@ -328,6 +352,7 @@ export class AtuaComputer {
         controlSab: childControlSab,
         dataSab: childDataSab,
         pipeFds: pipeFds || [],
+        bridgeSab: this._bridgeSab || null,
         wakeChannel: this._wakeChannel,
         engineModule: this._engineModule,
         vfsState: vfsState || {},
