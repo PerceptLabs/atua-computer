@@ -3,3 +3,5 @@ node_modules/
 wasm/debian-rootfs.tar
 test-results/
 wasix-bridge/target/
+wasmer-js-fork/
+wasix-bridge/target/

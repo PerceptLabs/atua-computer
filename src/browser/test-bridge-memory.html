@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script type="module">
+    const out = document.getElementById('output');
+    function log(msg) { out.textContent += msg + '\n'; console.log(msg); }
+
+    try {
+      // Load @wasmer/sdk from local node_modules
+      const { init, Wasmer, runWasix, initializeLogger } = await import('/node_modules/@wasmer/sdk/dist/index.mjs');
+      await init();
+      try { initializeLogger('info'); } catch(e) {} // Enable tracing output
+      log('SDK initialized');
+
+      // Load our bridge module (which imports memory via --import-memory)
+      const bridgeBytes = await fetch('/wasix-bridge.wasm').then(r => r.arrayBuffer());
+      log('Bridge WASM loaded: ' + bridgeBytes.byteLength + ' bytes');
+
+      const instance = await runWasix(new Uint8Array(bridgeBytes), { program: 'wasix-bridge' });
+      log('Instance created');
+
+      // Check every possible path to the memory buffer
+      const paths = [
+        ['instance.memory?.buffer', instance.memory?.buffer],
+        ['instance.exports?.memory?.buffer', instance.exports?.memory?.buffer],
+      ];
+      for (const [name, buf] of paths) {
+        if (buf) {
+          log(`${name}: exists, type=${buf.constructor.name}, byteLength=${buf.byteLength}`);
+          log(`  instanceof SharedArrayBuffer: ${buf instanceof SharedArrayBuffer}`);
+          log(`  instanceof ArrayBuffer: ${buf instanceof ArrayBuffer}`);
+          if (buf instanceof SharedArrayBuffer) {
+            const view = new Int32Array(buf, 0, 4);
+            log(`  Int32Array view works: ${view.length === 4}`);
+            log('RESULT: SharedArrayBuffer CONFIRMED');
+          }
+        } else {
+          log(`${name}: null/undefined`);
+        }
+      }
+
+      // Also check: what properties does the instance object have?
+      log('Instance keys: ' + Object.keys(instance).join(', '));
+      log('Instance prototype keys: ' + Object.getOwnPropertyNames(Object.getPrototypeOf(instance)).join(', '));
+
+      const { code, stdout } = await instance.wait();
+      log(`Process exited: code=${code}, stdout=${new TextDecoder().decode(stdout)}`);
+    } catch (e) {
+      log('ERROR: ' + e.message);
+      log('Stack: ' + e.stack);
+    }
+  </script>
+</head>
+<body><h3>Bridge Memory Test</h3><pre id="output"></pre></body>
+</html>

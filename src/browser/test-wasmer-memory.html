@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Wasmer Memory Test</title></head>
+<body>
+<pre id="output"></pre>
+<script type="module">
+const o = document.getElementById('output');
+function log(msg) { o.textContent += msg + '\n'; console.log(msg); }
+
+try {
+  log('Fetching wasix-bridge.wasm...');
+  const wasmBytes = await fetch('/wasix-bridge.wasm').then(r => r.arrayBuffer());
+  log('WASM loaded: ' + wasmBytes.byteLength + ' bytes');
+
+  // LOW-LEVEL INSTANTIATION — bypass @wasmer/sdk, provide WASI imports manually
+  // The bridge only needs 5 WASI imports: poll_oneoff, fd_write, environ_get, environ_sizes_get, proc_exit
+
+  const stderrBuf = [];
+  const wasiImports = {
+    wasi_snapshot_preview1: {
+      fd_write(fd, iovs_ptr, iovs_len, nwritten_ptr) {
+        // Minimal fd_write for stderr output
+        const mem = new Uint8Array(instance.exports.memory.buffer);
+        const view = new DataView(instance.exports.memory.buffer);
+        let total = 0;
+        for (let i = 0; i < iovs_len; i++) {
+          const bufPtr = view.getUint32(iovs_ptr + i * 8, true);
+          const bufLen = view.getUint32(iovs_ptr + i * 8 + 4, true);
+          const bytes = mem.slice(bufPtr, bufPtr + bufLen);
+          if (fd === 2) stderrBuf.push(new TextDecoder().decode(bytes));
+          total += bufLen;
+        }
+        view.setUint32(nwritten_ptr, total, true);
+        return 0;
+      },
+      environ_get(environ_ptr, environ_buf_ptr) { return 0; },
+      environ_sizes_get(count_ptr, buf_size_ptr) {
+        const view = new DataView(instance.exports.memory.buffer);
+        view.setUint32(count_ptr, 0, true);
+        view.setUint32(buf_size_ptr, 0, true);
+        return 0;
+      },
+      proc_exit(code) { log('proc_exit(' + code + ')'); },
+      poll_oneoff(in_ptr, out_ptr, nsubs, nevents_ptr) {
+        // Minimal: just sleep by returning 0 events
+        const view = new DataView(instance.exports.memory.buffer);
+        view.setUint32(nevents_ptr, 0, true);
+        return 0;
+      },
+    }
+  };
+
+  let instance;
+  log('Instantiating with manual WASI imports...');
+  const result = await WebAssembly.instantiate(wasmBytes, wasiImports);
+  instance = result.instance;
+  log('Instance created!');
+
+  // CHECK MEMORY ACCESS
+  const mem = instance.exports.memory;
+  log('memory: ' + typeof mem);
+  log('memory.buffer: ' + typeof mem.buffer);
+  log('buffer instanceof ArrayBuffer: ' + (mem.buffer instanceof ArrayBuffer));
+  log('buffer instanceof SharedArrayBuffer: ' + (mem.buffer instanceof SharedArrayBuffer));
+  log('buffer.byteLength: ' + mem.buffer.byteLength);
+
+  // Read magic value at offset 65536 (bridge writes 0xDEADBEEF there)
+  log('Calling _start...');
+  try { instance.exports._start(); } catch (e) { log('_start threw: ' + e.message); }
+
+  const magicView = new Uint32Array(mem.buffer, 65536, 2);
+  log('Magic[0]: 0x' + magicView[0].toString(16) + ' (expect DEADBEEF)');
+  log('Magic[1]: 0x' + magicView[1].toString(16) + ' (expect CAFEBABE)');
+  log('stderr: ' + stderrBuf.join(''));
+
+  // Can we share it with a Worker?
+  log('Can create Int32Array view: ' + (new Int32Array(mem.buffer, 65536, 4) instanceof Int32Array));
+  log('SUCCESS: Direct memory access works!');
+
+} catch (err) {
+  log('ERROR: ' + err.message);
+  log(err.stack);
+}
+</script>
+</body>
+</html>
